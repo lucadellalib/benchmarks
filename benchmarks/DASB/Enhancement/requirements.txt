@@ -1,3 +1,4 @@
+git+https://github.com/facebookresearch/encodec
 librosa
 onnxruntime
 transformers>=4.31.0
