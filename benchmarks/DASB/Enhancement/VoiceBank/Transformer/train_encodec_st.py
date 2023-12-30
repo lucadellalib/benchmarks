@@ -51,14 +51,29 @@ class Enhancement(sb.Brain):
         in_tokens = tokens[: len(tokens) // 2]
         batch.out_tokens = tokens[len(tokens) // 2 :], out_sig_lens
 
-        # Forward embedding layer
-        in_embs = self.modules.embedding(in_tokens)
+        # Forward embedding layer (one for each codebook)
+        in_tokens += torch.arange(
+            0,
+            self.hparams.num_codebooks * self.hparams.vocab_size,
+            self.hparams.vocab_size,
+            device=self.device,
+        )  # Offset to select embeddings from the correct codebook
+        in_embs = (
+            self.modules.embedding(in_tokens)
+            .reshape(
+                len(batch),
+                -1,
+                self.hparams.embedding_dim,
+                self.hparams.num_codebooks,
+            )
+            .sum(dim=-1)
+        )
 
         # Forward encoder
         enc_out = self.modules.encoder.encode(in_embs, in_sig_lens)
         enc_out = self.modules.encoder_proj(enc_out)
 
-        # Forward decoder/predictor
+        # Forward embedding layer (one for each codebook)
         out_tokens, out_tokens_bos_lens = batch.out_tokens
         out_tokens_bos = torch.cat(
             [
@@ -71,7 +86,24 @@ class Enhancement(sb.Brain):
             ],
             dim=-2,
         )
-        out_embs_bos = self.modules.embedding(out_tokens_bos)
+        out_tokens_bos += torch.arange(
+            0,
+            self.hparams.num_codebooks * self.hparams.vocab_size,
+            self.hparams.vocab_size,
+            device=self.device,
+        )  # Offset to select embeddings from the correct codebook
+        out_embs_bos = (
+            self.modules.embedding(out_tokens_bos)
+            .reshape(
+                len(batch),
+                -1,
+                self.hparams.embedding_dim,
+                self.hparams.num_codebooks,
+            )
+            .sum(dim=-1)
+        )
+
+        # Forward decoder
         dec_out, _ = self.modules.decoder(
             out_embs_bos, lengths=out_tokens_bos_lens
         )
@@ -80,8 +112,10 @@ class Enhancement(sb.Brain):
         # Forward joiner
         join_out = self.modules.joiner(enc_out, dec_out)
 
-        # Compute cross-entropy logits
-        ce_logits = self.modules.ce_head(join_out)
+        # Compute cross-entropy logits (one for each codebook)
+        ce_logits = self.modules.ce_head(join_out).reshape(
+            len(batch), -1, self.hparams.num_codebooks, self.hparams.vocab_size,
+        )
 
         # Compute outputs
         hyps = None
@@ -93,18 +127,17 @@ class Enhancement(sb.Brain):
                 and current_epoch % self.hparams.valid_search_freq == 0
             )
         ):
-            hyps = (
-                (
+            if self.hparams.use_teacher_forcing:
+                # Teacher forcing
+                hyps = ce_logits.argmax(dim=-1)
+            else:
+                # Search
+                hyps = (
                     self.hparams.beam_searcher
                     if stage == sb.Stage.TEST
                     else self.hparams.greedy_searcher
                 )(enc_out, in_sig_lens)
-                .flatten(start_dim=-2)
-                .tolist()
-            )
-
-            # Teacher forcing
-            # hyps = ce_logits.argmax(dim=-1).flatten(start_dim=-2).tolist()
+            hyps = hyps.flatten(start_dim=-2).tolist()
 
             # Remove padding (output length is equal to input length)
             min_length = self.hparams.num_codebooks
@@ -455,14 +488,14 @@ if __name__ == "__main__":
 
     # Use pretrained embeddings
     if hparams["use_pretrained_embeddings"]:
-        for head, pretrained_weight in zip(
-            hparams["embedding"].heads, hparams["codec"].vocabulary
-        ):
-            head.weight.data.copy_(pretrained_weight)
+        weight = hparams["codec"].vocabulary.reshape(
+            -1, hparams["embedding_dim"]
+        )
+        hparams["embedding"].weight.data[: len(weight)].copy_(weight)
 
     # Freeze embeddings
     if hparams["freeze_embeddings"]:
-        hparams["embeddings"].requires_grad_(False)
+        hparams["embedding"].requires_grad_(False)
 
     # Create the datasets objects and tokenization
     train_data, valid_data, test_data = dataio_prepare(hparams)

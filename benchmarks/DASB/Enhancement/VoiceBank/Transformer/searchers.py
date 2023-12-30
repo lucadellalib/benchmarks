@@ -84,7 +84,19 @@ class STDecoder(torch.nn.Module):
             The logits, shape: ``[batch_size, seq_length, num_codebooks, vocab_size]``.
 
         """
-        embs_bos = self.embedding(tokens_bos)
+        batch_size = tokens_bos.shape[0]
+        num_codebooks = tokens_bos.shape[-1]
+        vocab_size = self.embedding.num_embeddings // num_codebooks - 1
+        tokens_bos = tokens_bos + torch.arange(  # Copy to avoid side effects
+            0, num_codebooks * vocab_size, vocab_size, device=tokens_bos.device,
+        )  # Offset to select embeddings from the correct codebook
+        embs_bos = (
+            self.embedding(tokens_bos)
+            .reshape(
+                batch_size, -1, self.embedding.embedding_dim, num_codebooks,
+            )
+            .sum(dim=-1)
+        )
         if self.has_hidden_state:
             dec_out, hidden_state = self.decoder(
                 embs_bos, lengths=enc_out_lens, hx=hidden_state
@@ -93,7 +105,9 @@ class STDecoder(torch.nn.Module):
             dec_out = self.decoder(embs_bos, enc_out_lens)[0]
         dec_out = self.decoder_proj(dec_out)
         join_out = self.joiner(enc_out, dec_out)
-        logits = self.head(join_out)
+        logits = self.head(join_out).reshape(
+            batch_size, -1, num_codebooks, vocab_size,
+        )
         return logits, hidden_state
 
 

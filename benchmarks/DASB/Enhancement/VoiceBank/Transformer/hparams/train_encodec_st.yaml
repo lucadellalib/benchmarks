@@ -12,8 +12,8 @@ __set_seed: !apply:torch.manual_seed [!ref <seed>]
 # Data preparation
 data_folder: !PLACEHOLDER
 train_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
-valid_csv: !ref <save_folder>/voicebank_validset_wav.csv
-test_csv: !ref <save_folder>/voicebank_testset_wav.csv
+valid_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
+test_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
 splits: [trainset_28spk_wav, validset_wav, testset_wav]
 num_valid_speakers: 2
 
@@ -91,6 +91,7 @@ joint_dim: 640
 
 # Search parameters
 valid_search_freq: 1
+use_teacher_forcing: False
 beam_size: 10
 lm_weight: 0.0
 has_hidden_state: False
@@ -134,9 +135,8 @@ codec: !new:speechbrain.lobes.models.huggingface_transformers.encodec.Encodec
 lm: !new:lm.EncodecLM
     variant: encodec_24khz
 
-embedding: !new:nnet.MultiHeadEmbedding
-    num_heads: !ref <num_codebooks>
-    num_embeddings: !ref <vocab_size> + 1
+embedding: !new:torch.nn.Embedding
+    num_embeddings: !ref (<vocab_size> + 1) * <num_codebooks>
     embedding_dim: !ref <embedding_dim>
 
 encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
@@ -171,10 +171,9 @@ joiner: !new:speechbrain.nnet.transducer.transducer_joint.Transducer_joint
     joint: sum
     nonlinearity: !ref <activation>
 
-ce_head: !new:nnet.MultiHeadLinear
-    num_heads: !ref <num_codebooks>
-    in_features: !ref <joint_dim>
-    out_features: !ref <vocab_size>
+ce_head: !new:speechbrain.nnet.linear.Linear
+    input_size: !ref <joint_dim>
+    n_neurons: !ref <vocab_size> * <num_codebooks>
 
 modules:
     codec: !ref <codec>
