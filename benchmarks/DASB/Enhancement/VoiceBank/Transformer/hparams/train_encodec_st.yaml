@@ -12,8 +12,8 @@ __set_seed: !apply:torch.manual_seed [!ref <seed>]
 # Data preparation
 data_folder: !PLACEHOLDER
 train_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
-valid_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
-test_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
+valid_csv: !ref <save_folder>/voicebank_validset_wav.csv
+test_csv: !ref <save_folder>/voicebank_testset_wav.csv
 splits: [trainset_28spk_wav, validset_wav, testset_wav]
 num_valid_speakers: 2
 
@@ -29,7 +29,7 @@ save_audios: True
 train_remove_if_longer: 60.0  # Seconds
 valid_remove_if_longer: 60.0  # Seconds
 test_remove_if_longer: 60.0  # Seconds
-sorting: ascending
+sorting: descending
 
 # Training parameters
 num_epochs: 30
@@ -37,7 +37,7 @@ grad_accumulation_factor: 1
 dynamic_batching: False
 train_batch_size: 16
 valid_batch_size: 16
-test_batch_size: 1
+test_batch_size: 16
 train_max_batch_length: 40.0  # Seconds
 valid_max_batch_length: 40.0  # Seconds
 test_max_batch_length: 40.0  # Seconds
@@ -46,7 +46,7 @@ max_batch_size: 128
 dataloader_workers: 4
 nonfinite_patience: 10
 max_grad_norm: 5.0
-precision: fp16
+precision: fp32
 ckpt_interval_minutes: 600
 keep_checkpoints: 2
 augment: True
