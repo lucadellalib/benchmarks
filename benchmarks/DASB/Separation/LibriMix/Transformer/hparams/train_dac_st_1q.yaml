@@ -3,7 +3,7 @@
 # Authors: Luca Della Libera 2023
 # ############################################################################
 
-experiment_name: dac_st_<target_codebook>
+experiment_name: dac_st_1q_<target_codebook>
 
 # Seed needs to be set at top of YAML
 seed: 0
