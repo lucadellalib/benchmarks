@@ -1,6 +1,6 @@
 #!/usr/bin/env/python
 
-"""Recipe for training an encoder-only transformer-based speech enhancement system using
+"""Recipe for training a simplified transducer transformer-based speech separation system using
 discrete audio representations (see https://arxiv.org/abs/2312.09747).
 
 The model is trained via cross-entropy loss applied to each timestep using EnCodec audio
@@ -10,13 +10,14 @@ The neural network architecture is inspired by:
 https://github.com/facebookresearch/encodec/blob/0e2d0aed29362c8e8f52494baf3e6f99056b214f/encodec/model.py#L27
 
 To run this recipe:
-> python train_encodec.py hparams/train_encodec.yaml
+> python train_encodec_st.py hparams/train_encodec_st.yaml
 
 Authors
  * Luca Della Libera 2023
 """
 
 import csv
+import itertools
 import os
 import sys
 
@@ -28,7 +29,7 @@ from speechbrain.dataio.sampler import DynamicBatchSampler
 from speechbrain.utils.distributed import if_main_process, run_on_main
 
 
-class Enhancement(sb.Brain):
+class Separation(sb.Brain):
     def compute_forward(self, batch, stage):
         """Forward pass."""
         current_epoch = self.hparams.epoch_counter.current
@@ -41,20 +42,80 @@ class Enhancement(sb.Brain):
         if stage == sb.Stage.TRAIN and self.hparams.augment:
             in_sig, in_sig_lens = self.hparams.augmentation(in_sig, in_sig_lens)
 
+        # Unflatten
+        out_sig = out_sig.reshape(
+            len(batch), self.hparams.num_speakers, -1
+        )  # [B, S, T]
+
+        # Stack along batch dimension
+        out_sig = out_sig.reshape(-1, out_sig.shape[-1])  # [B * S, T]
+
         # Extract audio tokens
         assert (in_sig_lens == out_sig_lens).all()
-        sig, lens = (
-            torch.cat([in_sig, out_sig]),
-            torch.cat([in_sig_lens, out_sig_lens]),
+        sig = torch.cat([in_sig, out_sig])
+        lens = torch.cat(
+            [
+                in_sig_lens,
+                out_sig_lens[:, None]
+                .expand(-1, self.hparams.num_speakers)
+                .flatten(),
+            ]
         )
         with torch.no_grad():
             self.hparams.codec.to(self.device).eval()
             tokens = self.hparams.codec.encode(sig, lens)[0]
-        in_tokens = tokens[: len(tokens) // 2]
-        batch.out_tokens = tokens[len(tokens) // 2 :], out_sig_lens
+        in_tokens = tokens[: len(tokens) // (self.hparams.num_speakers + 1)]
+        out_tokens = tokens[
+            len(tokens) // (self.hparams.num_speakers + 1) :
+        ]  # [B * S, N, K]
+        out_tokens = out_tokens.reshape(
+            len(batch),
+            self.hparams.num_speakers,
+            -1,
+            self.hparams.num_codebooks,
+        )  # [B, S, N, K]
+        out_tokens = out_tokens.movedim(-3, -1).reshape(
+            len(batch),
+            -1,
+            self.hparams.num_codebooks * self.hparams.num_speakers,
+        )  # [B, N, K * S]
+        batch.out_tokens = out_tokens, out_sig_lens
 
         # Forward encoder
-        ce_logits = self.modules.st_encoder(in_tokens, in_sig_lens)
+        enc_out = self.modules.st_encoder(in_tokens, in_sig_lens)
+
+        # Generate BOS tokens via teacher forcing if specified
+        if (
+            stage == sb.Stage.TRAIN
+            and current_epoch > self.hparams.teacher_forcing_after_epoch
+        ):
+            with torch.no_grad():
+                hyps = self.hparams.greedy_searcher(
+                    enc_out, torch.ones(len(enc_out), device=self.device)
+                )
+            out_tokens = hyps
+        else:
+            out_tokens, _ = batch.out_tokens
+
+        # Forward decoder
+        out_tokens_bos = torch.cat(
+            [
+                torch.full(
+                    (
+                        len(out_tokens),
+                        1,
+                        self.hparams.num_codebooks * self.hparams.num_speakers,
+                    ),
+                    self.hparams.bos_index,
+                    device=self.device,
+                ),
+                out_tokens[:, :-1],
+            ],
+            dim=-2,
+        )
+        ce_logits, *_ = self.modules.st_decoder(
+            enc_out, out_tokens_bos, in_sig_lens
+        )
 
         # Compute outputs
         hyps = None
@@ -66,10 +127,21 @@ class Enhancement(sb.Brain):
                 and current_epoch % self.hparams.valid_search_freq == 0
             )
         ):
-            hyps = ce_logits.argmax(dim=-1).flatten(start_dim=-2).tolist()
+            if self.hparams.use_teacher_forcing:
+                # Teacher forcing
+                hyps = ce_logits.argmax(dim=-1)
+            else:
+                # Search
+                hyps = (
+                    self.hparams.beam_searcher
+                    if stage == sb.Stage.TEST
+                    else self.hparams.greedy_searcher
+                )(enc_out, in_sig_lens)
+
+            hyps = hyps.flatten(start_dim=-2).tolist()
 
             # Remove padding (output length is equal to input length)
-            min_length = self.hparams.num_codebooks
+            min_length = self.hparams.num_codebooks * self.hparams.num_speakers
             hyps = [
                 hyp[: min_length * int(len(hyp) * rel_length / min_length)]
                 for hyp, rel_length in zip(hyps, in_sig_lens)
@@ -84,18 +156,67 @@ class Enhancement(sb.Brain):
         IDs = batch.id
         out_tokens, out_tokens_lens = batch.out_tokens
 
-        # Cross-entropy loss
-        loss = self.hparams.ce_loss(
-            ce_logits.log_softmax(dim=-1).flatten(start_dim=-3, end_dim=-2),
-            out_tokens.flatten(start_dim=-2),
-            length=out_tokens_lens,
-        )
+        if not self.hparams.use_pit:
+            # Cross-entropy loss
+            loss = self.hparams.ce_loss(
+                ce_logits.log_softmax(dim=-1).flatten(start_dim=-3, end_dim=-2),
+                out_tokens.flatten(start_dim=-2),
+                length=out_tokens_lens,
+            )
+        else:
+            # Batch of permutation matrices (one for each of the factorial(num_speakers) permutations)
+            perms = itertools.permutations(range(self.hparams.num_speakers))
+            perm_matrix = torch.stack(
+                [
+                    torch.eye(self.hparams.num_speakers, device=self.device)[
+                        torch.as_tensor(perm)
+                    ]
+                    for perm in perms
+                ]
+            )
+
+            # Apply permutations
+            batch_size = len(out_tokens)
+            num_perms = len(perm_matrix)
+            num_heads = self.hparams.num_codebooks * self.hparams.num_speakers
+            perm_out_tokens = (
+                (
+                    out_tokens.reshape(-1, self.hparams.num_speakers)
+                    .expand(num_perms, -1, -1)
+                    .type(perm_matrix.dtype)
+                    @ perm_matrix
+                )
+                .reshape(num_perms, batch_size, -1, num_heads)
+                .long()
+            )
+
+            # Cross-entropy loss
+            ce_logits = ce_logits.expand(num_perms, -1, -1, -1, -1).reshape(
+                num_perms * batch_size, -1, num_heads, self.hparams.vocab_size
+            )
+            perm_out_tokens = perm_out_tokens.reshape(
+                num_perms * batch_size, -1, num_heads
+            )
+            loss = self.hparams.ce_loss(
+                ce_logits.log_softmax(dim=-1).flatten(start_dim=-3, end_dim=-2),
+                perm_out_tokens.flatten(start_dim=-2),
+                length=out_tokens_lens.expand(num_perms, -1).flatten(),
+                reduction="batch",
+            ).reshape(num_perms, batch_size)
+            loss, idxes = loss.min(dim=0)
+            loss = loss.mean()
+
+            # Select tokens corresponding to the permutation with minimum loss
+            out_tokens = perm_out_tokens[
+                idxes * batch_size
+                + torch.arange(0, batch_size, device=self.device)
+            ]
 
         if hyps is not None:
             targets = out_tokens.flatten(start_dim=-2).tolist()
 
             # Remove padding
-            min_length = self.hparams.num_codebooks
+            min_length = self.hparams.num_codebooks * self.hparams.num_speakers
             targets = [
                 target[
                     : min_length * int(len(target) * rel_length / min_length)
@@ -208,27 +329,43 @@ class Enhancement(sb.Brain):
             )
 
             # Decode
-            hyp_tokens = torch.as_tensor(
-                hyp_tokens, device=self.device
-            ).reshape(-1, self.hparams.num_codebooks)
-            rec_tokens = torch.as_tensor(
-                rec_tokens, device=self.device
-            ).reshape(-1, self.hparams.num_codebooks)
+            hyp_tokens = (
+                torch.as_tensor(hyp_tokens, device=self.device)
+                .reshape(
+                    -1, self.hparams.num_codebooks, self.hparams.num_speakers,
+                )
+                .movedim(-1, 0)
+            )
+            rec_tokens = (
+                torch.as_tensor(rec_tokens, device=self.device)
+                .reshape(
+                    -1, self.hparams.num_codebooks, self.hparams.num_speakers,
+                )
+                .movedim(-1, 0)
+            )
 
             with torch.no_grad():
                 if self.hparams.use_vocos:
                     vocos.to(self.device).eval()
-                    hyp_sig = vocos(hyp_tokens[None], torch.tensor([1.0]))[0][0]
-                    rec_sig = vocos(rec_tokens[None], torch.tensor([1.0]))[0][0]
+                    hyp_sig = vocos(
+                        hyp_tokens, torch.ones(self.hparams.num_speakers)
+                    )[0].flatten()
+                    rec_sig = vocos(
+                        rec_tokens, torch.ones(self.hparams.num_speakers)
+                    )[0].flatten()
                 else:
                     self.hparams.codec.to(self.device).eval()
-                    hyp_sig = self.hparams.codec.decode(hyp_tokens[None])[0, 0]
-                    rec_sig = self.hparams.codec.decode(rec_tokens[None])[0, 0]
+                    hyp_sig = self.hparams.codec.decode(hyp_tokens)[
+                        :, 0
+                    ].flatten()
+                    rec_sig = self.hparams.codec.decode(rec_tokens)[
+                        :, 0
+                    ].flatten()
             ref_sig = self.test_set[self.test_set.data_ids.index(ID)][
                 "out_sig"
             ].to(
                 self.device
-            )  # Original output signal (resampled)
+            )  # Original output signal (resampled and flattened)
             in_sig = self.test_set[self.test_set.data_ids.index(ID)][
                 "in_sig"
             ]  # Original input signal (resampled)
@@ -257,19 +394,58 @@ class Enhancement(sb.Brain):
                     self.hparams.sample_rate,
                 )
 
-            # Compute metrics
-            min_length = min(len(hyp_sig), len(ref_sig))
-            sisnr = -si_snr_loss(
-                hyp_sig[None, :min_length],
-                ref_sig[None, :min_length],
-                torch.as_tensor([1.0], device=self.device),
-            ).item()
-            dnsmos = DNSMOS(hyp_sig, self.hparams.sample_rate)
-            rec_dnsmos = DNSMOS(rec_sig, self.hparams.sample_rate)
-            ref_dnsmos = DNSMOS(ref_sig, self.hparams.sample_rate)
-            dwer, text, ref_text = DWER(
-                hyp_sig, ref_sig, self.hparams.sample_rate
-            )
+            # Compute metrics (average over speakers)
+            spk_sisnrs = []
+            spk_dnsmoses = []
+            spk_rec_dnsmoses = []
+            spk_ref_dnsmoses = []
+            spk_dwers = []
+            spk_texts = []
+            spk_ref_texts = []
+
+            spk_hyp_sig_length = len(hyp_sig) // self.hparams.num_speakers
+            spk_rec_sig_length = len(rec_sig) // self.hparams.num_speakers
+            spk_ref_sig_length = len(ref_sig) // self.hparams.num_speakers
+
+            for i in range(self.hparams.num_speakers):
+                spk_hyp_sig = hyp_sig[
+                    i * spk_hyp_sig_length : (i + 1) * spk_hyp_sig_length
+                ]
+                spk_rec_sig = rec_sig[
+                    i * spk_rec_sig_length : (i + 1) * spk_rec_sig_length
+                ]
+                spk_ref_sig = ref_sig[
+                    i * spk_ref_sig_length : (i + 1) * spk_ref_sig_length
+                ]
+
+                spk_min_length = min(len(spk_hyp_sig), len(spk_ref_sig))
+                spk_sisnr = -si_snr_loss(
+                    spk_hyp_sig[None, :spk_min_length],
+                    spk_ref_sig[None, :spk_min_length],
+                    torch.as_tensor([1.0], device=self.device),
+                ).item()
+                spk_dnsmos = DNSMOS(spk_hyp_sig, self.hparams.sample_rate)
+                spk_rec_dnsmos = DNSMOS(spk_rec_sig, self.hparams.sample_rate)
+                spk_ref_dnsmos = DNSMOS(spk_ref_sig, self.hparams.sample_rate)
+                spk_dwer, spk_text, spk_ref_text = DWER(
+                    spk_hyp_sig, spk_ref_sig, self.hparams.sample_rate
+                )
+
+                spk_sisnrs.append(spk_sisnr)
+                spk_dnsmoses.append(spk_dnsmos)
+                spk_rec_dnsmoses.append(spk_rec_dnsmos)
+                spk_ref_dnsmoses.append(spk_ref_dnsmos)
+                spk_dwers.append(spk_dwer)
+                spk_texts.append(spk_text)
+                spk_ref_texts.append(spk_ref_text)
+
+            sisnr = sum(spk_sisnrs) / len(spk_sisnrs)
+            dnsmos = sum(spk_dnsmoses) / len(spk_dnsmoses)
+            rec_dnsmos = sum(spk_rec_dnsmoses) / len(spk_rec_dnsmoses)
+            ref_dnsmos = sum(spk_ref_dnsmoses) / len(spk_ref_dnsmoses)
+            dwer = sum(spk_dwers) / len(spk_dwers)
+            text = " || ".join(spk_texts)
+            ref_text = " || ".join(spk_ref_texts)
 
             IDs.append(ID)
             sisnrs.append(sisnr)
@@ -373,24 +549,55 @@ def dataio_prepare(hparams):
     datasets = [train_data, valid_data, test_data]
 
     # 2. Define audio pipeline
-    takes = ["noisy_wav", "clean_wav"]
+    takes = (
+        ["mix_clean_wav"]
+        + [f"src{i}_wav" for i in range(1, hparams["num_speakers"] + 1)]
+        + (["noise_wav"] if hparams["add_noise"] else [])
+    )
     provides = ["in_sig", "out_sig"]
 
-    def audio_pipeline(noisy_wav, clean_wav):
-        # Noisy signal
-        noisy_sig, sample_rate = torchaudio.load(noisy_wav)
-        noisy_sig = noisy_sig[0]  # [T]
+    def audio_pipeline(mix_wav, *src_and_noise_wavs):
+        src_wavs = src_and_noise_wavs[: hparams["num_speakers"]]
+
+        # Clean signals
+        clean_sigs = []
+        for src_wav in src_wavs:
+            clean_sig, sample_rate = torchaudio.load(src_wav)
+            clean_sigs.append(clean_sig)
+        clean_sigs = torch.cat(clean_sigs)  # [S, T]
+
+        # Mixed signal
+        mix_sig, sample_rate = torchaudio.load(mix_wav)
+        mix_sig = mix_sig[0]  # [T]
+
+        if hparams["add_noise"]:
+            # Noise signal
+            noise_wav = src_and_noise_wavs[-1]
+            noise_sig, sample_rate = torchaudio.load(noise_wav)
+            noise_sig = noise_sig[0]  # [T]
+
+            # Mixing with given noise gain
+            noise_gain = -hparams["snr"]
+            mix_sig_power = (mix_sig ** 2).mean()
+            ratio = 10 ** (
+                noise_gain / 10
+            )  # ratio = noise_sig_power / mix_sig_power
+            desired_noise_sig_power = ratio * mix_sig_power
+            noise_sig_power = (noise_sig ** 2).mean()
+            gain = (desired_noise_sig_power / noise_sig_power).sqrt()
+            noise_sig *= gain
+            mix_sig += noise_sig
+
         in_sig = torchaudio.functional.resample(
-            noisy_sig, sample_rate, hparams["sample_rate"],
+            mix_sig, sample_rate, hparams["sample_rate"],
         )
         yield in_sig
 
-        # Clean signal
-        clean_sig, sample_rate = torchaudio.load(clean_wav)
-        clean_sig = clean_sig[0]  # [T]
         out_sig = torchaudio.functional.resample(
-            clean_sig, sample_rate, hparams["sample_rate"],
+            clean_sigs, sample_rate, hparams["sample_rate"],
         )
+        # Flatten as SpeechBrain's dataloader does not support multichannel audio
+        out_sig = out_sig.flatten()  # [S * T]
         yield out_sig
 
     sb.dataio.dataset.add_dynamic_item(
@@ -419,8 +626,7 @@ if __name__ == "__main__":
         overrides=overrides,
     )
 
-    # Dataset preparation
-    from voicebank_prepare import prepare_voicebank as prepare_data  # noqa
+    from librimix_prepare import prepare_librimix as prepare_data  # noqa
 
     # Due to DDP, do the preparation ONLY on the main Python process
     run_on_main(
@@ -429,7 +635,9 @@ if __name__ == "__main__":
             "data_folder": hparams["data_folder"],
             "save_folder": hparams["save_folder"],
             "splits": hparams["splits"],
-            "num_valid_speakers": hparams["num_valid_speakers"],
+            "num_speakers": hparams["num_speakers"],
+            "add_noise": hparams["add_noise"],
+            "version": hparams["version"],
         },
     )
 
@@ -448,7 +656,7 @@ if __name__ == "__main__":
     train_data, valid_data, test_data = dataio_prepare(hparams)
 
     # Trainer initialization
-    brain = Enhancement(
+    brain = Separation(
         modules=hparams["modules"],
         opt_class=hparams["opt_class"],
         hparams=hparams,

@@ -1,5 +1,5 @@
-﻿# ############################################################################
-# Model: CRDNN with EnCodec audio representations (see https://arxiv.org/abs/2210.13438)
+# ############################################################################
+# Model: Transformer with EnCodec audio representations (see https://arxiv.org/abs/2210.13438)
 # Authors: Luca Della Libera 2023
 # ############################################################################
 
@@ -11,11 +11,13 @@ __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
 # Data preparation
 data_folder: !PLACEHOLDER
-train_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
-valid_csv: !ref <save_folder>/voicebank_validset_wav.csv
-test_csv: !ref <save_folder>/voicebank_testset_wav.csv
-splits: [trainset_28spk_wav, validset_wav, testset_wav]
-num_valid_speakers: 2
+train_csv: !ref <save_folder>/librimix_<num_speakers>mix_train-100.csv
+valid_csv: !ref <save_folder>/librimix_<num_speakers>mix_dev.csv
+test_csv: !ref <save_folder>/librimix_<num_speakers>mix_test.csv
+splits: [train-100, dev, test]
+num_speakers: 2
+add_noise: False
+version: wav16k/min
 
 # Output folders
 output_folder: !ref results/<experiment_name>/<seed>
@@ -24,15 +26,16 @@ save_folder: !ref <output_folder>/save
 # Save options
 vocode: True
 save_audios: True
+use_vocos: False
 
 # Preprocessing parameters
 train_remove_if_longer: 60.0  # Seconds
 valid_remove_if_longer: 60.0  # Seconds
 test_remove_if_longer: 60.0  # Seconds
-sorting: descending
+sorting: ascending
 
 # Training parameters
-num_epochs: 30
+num_epochs: 10
 grad_accumulation_factor: 1
 dynamic_batching: False
 train_batch_size: 16
@@ -51,6 +54,8 @@ ckpt_interval_minutes: 600
 keep_checkpoints: 2
 augment: True
 augment_prob: 0.75
+use_pit: False  # Set to True to use permutation invariant loss
+snr: 5  # dB  # Used only if `add_noise` is True
 
 # Optimizer parameters
 lr: 0.0005
@@ -61,28 +66,27 @@ patient: 0
 enable_scheduler: True
 
 # EnCodec parameters
-sample_rate: 24000  # NOTE: must match EnCodec's sample rate
-vocab_size: 1024  # NOTE: must match EnCodec's codebook size
-bandwidth: 1.5  # [1.5, 3.0, 6.0, 12.0, 24.0]
-num_codebooks: 2  # NOTE: must match EnCodec's number of codebooks at the given bandwidth [2, 4, 8, 16, 32]
+# sample_rate: [24000, 24000, 24000, 24000]
+# vocab_size: [1024, 1024, 1024, 1024]
+# bandwidth: [1.5, 3.0, 6.0, 12.0, 24.0]
+# num_codebooks: [2, 4, 8, 16, 32]
+sample_rate: 24000
+vocab_size: 1024
+bandwidth: 3.0
+num_codebooks: 4
 
 # Encoder parameters
 embedding_dim: 128  # NOTE: if using pretrained embeddings, must match EnCodec's embedding size
 freeze_embeddings: False
 use_pretrained_embeddings: False
 dropout: 0.1
-activation: !name:torch.nn.LeakyReLU
-rnn_class: !name:speechbrain.nnet.RNN.LSTM
-rnn_layers: 4
-time_pooling_size: 1
-rnn_bidirectional: True
-rnn_neurons: 256
-dnn_blocks: 2
-dnn_neurons: 256
-cnn_blocks: 2
-cnn_channels: (32, 32)
-inter_layer_pooling_size: (2, 2)
-cnn_kernelsize: (3, 3)
+activation: !name:torch.nn.GELU
+d_model: 256
+nhead: 8
+num_layers: 6
+d_ffn: 512
+max_length: 5000
+encoder_module: conformer
 
 # Search parameters
 valid_search_freq: 1
@@ -126,40 +130,36 @@ embedding: !new:torch.nn.Embedding
     num_embeddings: !ref <vocab_size> * <num_codebooks>
     embedding_dim: !ref <embedding_dim>
 
-encoder: !new:speechbrain.lobes.models.CRDNN.CRDNN
-    input_shape: [null, null, !ref <embedding_dim>]
-    activation: !ref <activation>
+encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
+    input_size: !ref <embedding_dim>
+    tgt_vocab: !ref <vocab_size>
+    d_model: !ref <d_model>
+    nhead: !ref <nhead>
+    num_encoder_layers: !ref <num_layers>
+    num_decoder_layers: 0
+    d_ffn: !ref <d_ffn>
     dropout: !ref <dropout>
-    cnn_blocks: !ref <cnn_blocks>
-    cnn_channels: !ref <cnn_channels>
-    cnn_kernelsize: !ref <cnn_kernelsize>
-    inter_layer_pooling_size: !ref <inter_layer_pooling_size>
-    time_pooling: True
-    using_2d_pooling: False
-    time_pooling_size: !ref <time_pooling_size>
-    rnn_class: !ref <rnn_class>
-    rnn_layers: !ref <rnn_layers>
-    rnn_neurons: !ref <rnn_neurons>
-    rnn_bidirectional: !ref <rnn_bidirectional>
-    dnn_blocks: !ref <dnn_blocks>
-    dnn_neurons: !ref <dnn_neurons>
-    rnn_re_init: True
-    use_rnnp: False
+    activation: !ref <activation>
+    max_length: !ref <max_length>
+    encoder_module: !ref <encoder_module>
+    normalize_before: True
+    causal: False
 
 ce_head: !new:speechbrain.nnet.linear.Linear
-    input_size: !ref <dnn_neurons>
-    n_neurons: !ref <vocab_size> * <num_codebooks>
+    input_size: !ref <d_model>
+    n_neurons: !ref <vocab_size> * <num_codebooks> * <num_speakers>
 
-modules:
-    codec: !ref <codec>
+# Simplified transducer
+st_encoder: !new:st.SimplifiedTransducerEncoder
     embedding: !ref <embedding>
     encoder: !ref <encoder>
-    ce_head: !ref <ce_head>
+    head: !ref <ce_head>
+
+modules:
+    st_encoder: !ref <st_encoder>
 
 model: !new:torch.nn.ModuleList
-    [[!ref <embedding>,
-      !ref <encoder>,
-      !ref <ce_head>]]
+    [[!ref <st_encoder>]]
 
 # Loss functions
 ce_loss: !name:speechbrain.nnet.losses.nll_loss

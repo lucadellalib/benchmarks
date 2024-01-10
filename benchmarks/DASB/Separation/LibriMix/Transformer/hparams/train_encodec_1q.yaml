@@ -1,9 +1,9 @@
 # ############################################################################
-# Model: Simplified transducer transformer with EnCodec audio representations (see https://arxiv.org/abs/2210.13438)
+# Model: Transformer with EnCodec audio representations (see https://arxiv.org/abs/2210.13438)
 # Authors: Luca Della Libera 2023
 # ############################################################################
 
-experiment_name: encodec_st
+experiment_name: !ref encodec_1q_<target_codebook>
 
 # Seed needs to be set at top of YAML
 seed: 0
@@ -11,19 +11,21 @@ __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
 # Data preparation
 data_folder: !PLACEHOLDER
-train_csv: !ref <save_folder>/voicebank_trainset_28spk_wav.csv
-valid_csv: !ref <save_folder>/voicebank_validset_wav.csv
-test_csv: !ref <save_folder>/voicebank_testset_wav.csv
-splits: [trainset_28spk_wav, validset_wav, testset_wav]
-num_valid_speakers: 2
+train_csv: !ref <save_folder>/librimix_<num_speakers>mix_train-100.csv
+valid_csv: !ref <save_folder>/librimix_<num_speakers>mix_dev.csv
+test_csv: !ref <save_folder>/librimix_<num_speakers>mix_test.csv
+splits: [train-100, dev, test]
+num_speakers: 2
+add_noise: False
+version: wav16k/min
 
 # Output folders
 output_folder: !ref results/<experiment_name>/<seed>
 save_folder: !ref <output_folder>/save
 
 # Save options
-vocode: True
-save_audios: True
+vocode: False
+save_audios: False
 use_vocos: False
 
 # Preprocessing parameters
@@ -33,8 +35,7 @@ test_remove_if_longer: 60.0  # Seconds
 sorting: ascending
 
 # Training parameters
-num_epochs: 30
-teacher_forcing_after_epoch: !ref <num_epochs>
+num_epochs: 10
 grad_accumulation_factor: 1
 dynamic_batching: False
 train_batch_size: 16
@@ -53,6 +54,8 @@ ckpt_interval_minutes: 600
 keep_checkpoints: 2
 augment: True
 augment_prob: 0.75
+use_pit: False  # Set to True to use permutation invariant loss
+snr: 5  # dB  # Used only if `add_noise` is True
 
 # Optimizer parameters
 lr: 0.0005
@@ -69,12 +72,9 @@ enable_scheduler: True
 # num_codebooks: [2, 4, 8, 16, 32]
 sample_rate: 24000
 vocab_size: 1024
-bandwidth: 1.5
-num_codebooks: 2
-
-# Special tokens
-bos_index: !ref <vocab_size>
-lm_bos_index: 0  # Pretrained EnCodec language model BOS index
+bandwidth: 3.0
+num_codebooks: 4
+target_codebook: 0
 
 # Encoder parameters
 embedding_dim: 128  # NOTE: if using pretrained embeddings, must match EnCodec's embedding size
@@ -89,19 +89,8 @@ d_ffn: 512
 max_length: 5000
 encoder_module: conformer
 
-# Decoder parameters
-rnn_neurons: 512
-rnn_num_layers: 1
-
-# Joiner parameters
-joint_dim: 640
-
 # Search parameters
 valid_search_freq: 1
-use_teacher_forcing: False
-beam_size: 10
-lm_weight: 0.0
-has_hidden_state: False
 
 # Augmentation
 drop_freq: !new:speechbrain.augment.time_domain.DropFreq
@@ -138,12 +127,8 @@ codec: !new:speechbrain.lobes.models.huggingface_transformers.encodec.Encodec
     freeze: True
     renorm_embeddings: False
 
-# Pretrained EnCodec language model
-lm: !new:lm.EncodecLM
-    variant: encodec_24khz
-
-encoder_embedding: !new:torch.nn.Embedding
-    num_embeddings: !ref <vocab_size> * <num_codebooks>
+embedding: !new:torch.nn.Embedding
+    num_embeddings: !ref <vocab_size> * (<num_codebooks> + <target_codebook> * <num_speakers>)
     embedding_dim: !ref <embedding_dim>
 
 encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
@@ -161,51 +146,21 @@ encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
     normalize_before: True
     causal: False
 
-encoder_proj: !new:torch.nn.Linear
-    in_features: !ref <d_model>
-    out_features: !ref <joint_dim>
-
-decoder_embedding: !new:torch.nn.Embedding
-    num_embeddings: !ref (<vocab_size> + 1) * <num_codebooks>
-    embedding_dim: !ref <embedding_dim>
-
-decoder: !new:speechbrain.nnet.RNN.LSTM
-    input_shape: [null, null, !ref <embedding_dim>]
-    hidden_size: !ref <rnn_neurons>
-    num_layers: !ref <rnn_num_layers>
-
-decoder_proj: !new:torch.nn.Linear
-    in_features: !ref <rnn_neurons>
-    out_features: !ref <joint_dim>
-
-joiner: !new:speechbrain.nnet.transducer.transducer_joint.Transducer_joint
-    joint: sum
-
 ce_head: !new:speechbrain.nnet.linear.Linear
-    input_size: !ref <joint_dim>
-    n_neurons: !ref <vocab_size> * <num_codebooks>
+    input_size: !ref <d_model>
+    n_neurons: !ref <vocab_size> * <num_speakers>
 
 # Simplified transducer
 st_encoder: !new:st.SimplifiedTransducerEncoder
-    embedding: !ref <encoder_embedding>
+    embedding: !ref <embedding>
     encoder: !ref <encoder>
-    encoder_proj: !ref <encoder_proj>
-
-st_decoder: !new:st.SimplifiedTransducerDecoder
-    embedding: !ref <decoder_embedding>
-    decoder: !ref <decoder>
-    decoder_proj: !ref <decoder_proj>
-    joiner: !ref <joiner>
     head: !ref <ce_head>
-    has_hidden_state: !ref <has_hidden_state>
 
 modules:
     st_encoder: !ref <st_encoder>
-    st_decoder: !ref <st_decoder>
 
 model: !new:torch.nn.ModuleList
-    [[!ref <st_encoder>,
-      !ref <st_decoder>]]
+    [[!ref <st_encoder>]]
 
 # Loss functions
 ce_loss: !name:speechbrain.nnet.losses.nll_loss
@@ -226,21 +181,6 @@ scheduler: !new:speechbrain.nnet.schedulers.NewBobScheduler
     improvement_threshold: !ref <improvement_threshold>
     annealing_factor: !ref <annealing_factor>
     patient: !ref <patient>
-
-# Searchers
-greedy_searcher: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index>
-
-beam_searcher: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index>
-    beam_size: !ref <beam_size>
-    lm: !ref <lm>
-    lm_weight: !ref <lm_weight>
-    lm_bos_id: !ref <lm_bos_index>
 
 # Performance metrics
 ter_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats

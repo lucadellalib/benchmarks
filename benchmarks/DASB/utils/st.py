@@ -1,23 +1,103 @@
-"""Simplified transducer searchers.
+"""Simplified transducer implementation.
 
 Authors
  * Luca Della Libera 2023
 """
 
-# Adapted from:
-# https://github.com/speechbrain/benchmarks/blob/d068d6142a29a38f6527b29948b180a1f89a21b4/benchmarks/CL_MASR/whisper/model.py#L188
-
 import torch
 import torch.nn.functional as F
 
 
-__all__ = ["STDecoder", "STSearcher"]
+__all__ = [
+    "SimplifiedTransducerDecoder",
+    "SimplifiedTransducerEncoder",
+    "SimplifiedTransducerSearcher",
+]
 
 
 _NUM_SPECIAL_TOKENS = 1
 
 
-class STDecoder(torch.nn.Module):
+class SimplifiedTransducerEncoder(torch.nn.Module):
+    """Simplified transducer encoder.
+
+    Arguments
+    ---------
+    embedding : torch.nn.Module
+        The embedding layer.
+    encoder : torch.nn.Module
+        The encoder module.
+    encoder_proj : torch.nn.Module
+        The encoder projection layer.
+    head : torch.nn.Module
+        The logits head.
+
+    """
+
+    def __init__(
+        self, embedding, encoder, encoder_proj=None, head=None,
+    ):
+        super().__init__()
+        self.embedding = embedding
+        self.encoder = encoder
+        self.encoder_proj = encoder_proj
+        self.head = head
+
+    def forward(self, tokens, tokens_lens=None):
+        """Forward pass.
+
+        Arguments
+        ---------
+        tokens : torch.LongTensor
+            The encoder tokens, shape: ``[batch_size, seq_length, num_channels]``.
+        tokens_lens : torch.Tensor
+            The relative lengths of the encoder tokens, shape: ``[batch_size]``.
+
+        Returns
+        -------
+        torch.Tensor
+            If `head` is provided, the logits, shape: ``[batch_size, seq_length, num_channels, vocab_size]``,
+            else the encoder hidden states, shape: ``[batch_size, seq_length, d_model]``.
+
+        """
+        batch_size = tokens.shape[0]
+        num_channels = tokens.shape[-1]
+        vocab_size = self.embedding.num_embeddings // num_channels
+
+        # Offset to select embeddings from the correct channel
+        tokens = tokens + torch.arange(  # Copy to avoid side effects
+            0, num_channels * vocab_size, vocab_size, device=tokens.device,
+        )
+
+        # Forward embedding layer (one for each channel)
+        embs = (
+            self.embedding(tokens)
+            .reshape(
+                batch_size, -1, self.embedding.embedding_dim, num_channels,
+            )
+            .sum(dim=-1)
+        )
+
+        # Forward encoder
+        enc_out = self.encoder.encode(embs, tokens_lens)
+        if self.encoder_proj is not None:
+            enc_out = self.encoder_proj(enc_out)
+
+        # If no head is provided, return encoder output
+        if self.head is None:
+            return enc_out
+
+        # Compute cross-entropy logits (one for each channel)
+        logits = self.head(enc_out)
+        num_heads = (
+            logits.shape[-1] // vocab_size
+        )  # Might have more heads than channels
+        logits = logits.reshape(batch_size, -1, num_heads, vocab_size)
+
+        return logits
+
+
+class SimplifiedTransducerDecoder(torch.nn.Module):
     """Simplified transducer decoder.
 
     Arguments
@@ -25,11 +105,11 @@ class STDecoder(torch.nn.Module):
     embedding : torch.nn.Module
         The embedding layer.
     decoder : torch.nn.Module
-        The decoder.
+        The decoder module.
     decoder_proj : torch.nn.Module
         The decoder projection layer.
     joiner : torch.nn.Module
-        The joiner.
+        The joiner module.
     head : torch.nn.Module
         The logits head.
     has_hidden_state : bool
@@ -51,7 +131,7 @@ class STDecoder(torch.nn.Module):
         decoder,
         decoder_proj,
         joiner,
-        head,
+        head=None,
         has_hidden_state=False,
     ):
         super().__init__()
@@ -70,67 +150,84 @@ class STDecoder(torch.nn.Module):
         Arguments
         ---------
         enc_out : torch.Tensor
-            The encoder output, shape: ``[batch_size, seq_length, enc_hidden_size]``.
+            The encoder hidden states, shape: ``[batch_size, seq_length, d_model]``.
         tokens_bos : torch.LongTensor
-            The decoder BOS tokens, shape: ``[batch_size, seq_length, num_codebooks]``.
+            The decoder BOS tokens, shape: ``[batch_size, seq_length, num_channels]``.
         enc_out_lens : torch.Tensor
-            The relative lengths of the encoder output, shape: ``[batch_size]``.
+            The relative lengths of the encoder hidden states, shape: ``[batch_size]``.
         hidden_state : Sequence[torch.Tensor]
-            The decoder hidden state, shape of i-th tensor: ``[:, batch_size, ...]``.
+            The decoder hidden state, shape of the i-th tensor: ``[:, batch_size, ...]``.
 
         Returns
         -------
         torch.Tensor
-            The logits, shape: ``[batch_size, seq_length, num_codebooks, vocab_size]``.
+            If `head` is provided, the logits, shape: ``[batch_size, seq_length, num_channels, vocab_size]``,
+            else the joiner hidden states, shape: ``[batch_size, seq_length, joint_dim]``.
+        Sequence[torch.Tensor]
+            The decoder hidden state, shape of the i-th tensor: ``[:, batch_size, ...]``.
 
         """
         batch_size = tokens_bos.shape[0]
-        num_codebooks = tokens_bos.shape[-1]
-        vocab_size = self.embedding.num_embeddings // num_codebooks - 1
+        num_channels = tokens_bos.shape[-1]
+        vocab_size = self.embedding.num_embeddings // num_channels - 1
+
+        # Offset to select embeddings from the correct channel
         tokens_bos = tokens_bos + torch.arange(  # Copy to avoid side effects
-            0, num_codebooks * vocab_size, vocab_size, device=tokens_bos.device,
-        )  # Offset to select embeddings from the correct codebook
+            0, num_channels * vocab_size, vocab_size, device=tokens_bos.device,
+        )
+
+        # Forward embedding layer (one for each channel)
         embs_bos = (
             self.embedding(tokens_bos)
             .reshape(
-                batch_size, -1, self.embedding.embedding_dim, num_codebooks,
+                batch_size, -1, self.embedding.embedding_dim, num_channels,
             )
             .sum(dim=-1)
         )
+
+        # Forward decoder
+        assert enc_out.shape[1] == embs_bos.shape[1]
         if self.has_hidden_state:
             dec_out, hidden_state = self.decoder(
                 embs_bos, lengths=enc_out_lens, hx=hidden_state
             )
         else:
-            dec_out = self.decoder(embs_bos, enc_out_lens)[0]
+            hidden_state = None
+            dec_out = self.decoder(embs_bos, lengths=enc_out_lens)[0]
         dec_out = self.decoder_proj(dec_out)
+
+        # Forward joiner
         join_out = self.joiner(enc_out, dec_out)
+
+        # If no head is provided, return joiner output
+        if self.head is None:
+            return join_out, hidden_state
+
+        # Compute cross-entropy logits (one for each channel)
         logits = self.head(join_out).reshape(
-            batch_size, -1, num_codebooks, vocab_size,
+            batch_size, -1, num_channels, vocab_size,
         )
+
         return logits, hidden_state
 
 
-class STSearcher(torch.nn.Module):
+class SimplifiedTransducerSearcher(torch.nn.Module):
     """Simplified transducer searcher.
 
     Arguments
     ---------
-    decoder : torch.nn.Module
-        A module that receives as input the audio features (shape: ``[batch_size, seq_length, hidden_size]``),
-        the transcription tokens (shape: ``[batch_size, seq_length, num_codebooks]``),
-        and their relative lengths (shape: ``[batch_size]``),
-        and returns the corresponding logits (shape: ``[batch_size, seq_length, num_codebooks, vocab_size]``).
-    num_codebooks : int
-        The number of codebooks.
+    st_decoder : SimplifiedTransducerDecoder
+        A simplified transducer decoder.
+    num_channels : int
+        The number of channels.
     bos_id : int
         The BOS index.
     beam_size : int
         The beam size. Greedy search is used if `beam_size` is 1,
         beam search otherwise.
     lm : torch.nn.Module
-        A module that receives as input the transcription tokens (shape: ``[batch_size, seq_length, num_codebooks]``)
-        and returns the next log probabilities (shape: ``[batch_size, seq_length, num_codebooks, vocab_size]``)
+        A module that receives as input the transcription tokens (shape: ``[batch_size, seq_length, num_channels]``)
+        and returns the next log probabilities (shape: ``[batch_size, seq_length, num_channels, vocab_size]``)
         (used only if `beam_size` > 1).
     lm_weight : float
         The language model weight
@@ -143,8 +240,8 @@ class STSearcher(torch.nn.Module):
 
     def __init__(
         self,
-        decoder,
-        num_codebooks,
+        st_decoder,
+        num_channels,
         bos_id,
         beam_size=1,
         lm=None,
@@ -152,35 +249,35 @@ class STSearcher(torch.nn.Module):
         lm_bos_id=0,
     ):
         super().__init__()
-        self.decoder = decoder
-        self.num_codebooks = num_codebooks
+        self.st_decoder = st_decoder
+        self.num_channels = num_channels
         self.bos_id = bos_id
         self.beam_size = beam_size
         self.lm = lm
         self.lm_weight = lm_weight
         self.lm_bos_id = lm_bos_id
 
-    def forward(self, audio_features, audio_features_lens):
+    def forward(self, enc_out, enc_out_lens):
         """Generate a transcription.
 
         Arguments
         ---------
-        audio_features : torch.Tensor
-            A batch of audio features, shape: ``[batch_size, seq_length, hidden_size]``
-        audio_features_lens : torch.Tensor
-            The relative lengths of the audio features, shape: ``[batch_size]``.
+        enc_out : torch.Tensor
+            The encoder hidden states, shape: ``[batch_size, seq_length, d_model]``
+        enc_out_lens : torch.Tensor
+            The relative lengths of the encoder hidden states, shape: ``[batch_size]``.
 
         Returns
         -------
         torch.LongTensor
-            The batch of hypotheses, shape: ``[batch_size, seq_length]``
+            The hypotheses, shape: ``[batch_size, seq_length]``
 
         """
         hyps, _ = generate(
-            self.decoder,
-            audio_features,
-            audio_features_lens,
-            self.num_codebooks,
+            self.st_decoder,
+            enc_out,
+            enc_out_lens,
+            self.num_channels,
             self.bos_id,
             self.beam_size,
             self.lm,
@@ -190,11 +287,13 @@ class STSearcher(torch.nn.Module):
         return hyps
 
 
+# Adapted from:
+# https://github.com/speechbrain/benchmarks/blob/d068d6142a29a38f6527b29948b180a1f89a21b4/benchmarks/CL_MASR/whisper/model.py#L188
 def generate(
     decoder,
     audio_features,
     audio_features_lens,
-    num_codebooks,
+    num_channels,
     bos_id,
     beam_size=1,
     lm=None,
@@ -208,23 +307,23 @@ def generate(
     ---------
     decoder : torch.nn.Module
         A module that receives as input the audio features (shape: ``[batch_size, seq_length, hidden_size]``),
-        the transcription tokens (shape: ``[batch_size, seq_length, num_codebooks]``),
+        the transcription tokens (shape: ``[batch_size, seq_length, num_channels]``),
         and their relative lengths (shape: ``[batch_size]``),
-        and returns the corresponding logits (shape: ``[batch_size, seq_length, num_codebooks, vocab_size]``).
+        and returns the corresponding logits (shape: ``[batch_size, seq_length, num_channels, vocab_size]``).
     audio_features : torch.Tensor
         A batch of audio features, shape: ``[batch_size, seq_length, hidden_size]``
     audio_features_lens : torch.Tensor
         The relative lengths of the audio features, shape: ``[batch_size]``.
-    num_codebooks : int
-        The number of codebooks.
+    num_channels : int
+        The number of channels.
     bos_id : int
         The BOS index.
     beam_size : int
         The beam size. Greedy search is used if `beam_size` is 1,
         beam search otherwise.
     lm : torch.nn.Module
-        A module that receives as input the transcription tokens (shape: ``[batch_size, seq_length, num_codebooks]``)
-        and returns the next log probabilities (shape: ``[batch_size, seq_length, num_codebooks, vocab_size]``)
+        A module that receives as input the transcription tokens (shape: ``[batch_size, seq_length, num_channels]``)
+        and returns the next log probabilities (shape: ``[batch_size, seq_length, num_channels, vocab_size]``)
         (used only if `beam_size` > 1).
     lm_weight : float
         The language model weight
@@ -254,7 +353,7 @@ def generate(
     batch_size = audio_features.shape[0]
     max_gen_tokens = audio_features.shape[1]
     hyps = torch.full(
-        (batch_size, max_gen_tokens + _NUM_SPECIAL_TOKENS, num_codebooks),
+        (batch_size, max_gen_tokens + _NUM_SPECIAL_TOKENS, num_channels),
         bos_id,
         dtype=torch.long,
         device=audio_features.device,
@@ -325,7 +424,7 @@ def _greedy_search(
         # B* x K
         log_probs, gen_token_ids = log_probs.max(dim=-1)
         # B*
-        alive_scores += log_probs.sum(dim=-1)  # Sum along codebook dimension
+        alive_scores += log_probs.sum(dim=-1)  # Sum along channel dimension
         # B* x K
         hyps[alive_mask, num_gen_tokens + _NUM_SPECIAL_TOKENS] = gen_token_ids
         scores[alive_mask] = alive_scores
@@ -365,7 +464,7 @@ def _beam_search(
     lm_bos_id=0,
 ):
     batch_size = audio_features.shape[0]
-    num_codebooks = hyps.shape[-1]
+    num_channels = hyps.shape[-1]
     abs_audio_features_lens = (
         audio_features.shape[1] * audio_features_lens
     ).long()
@@ -390,6 +489,8 @@ def _beam_search(
     )
     # : x B* x ...
     alive_hidden_states = None
+    lm_hidden_states = None
+    lm_offset = 0
     # Autoregressive loop
     while True:
         if num_gen_tokens == 0:
@@ -413,7 +514,7 @@ def _beam_search(
             ]
             # NB* x T x K
             alive_hyps = alive_hyps.movedim(0, 1).reshape(
-                beam_size * alive_batch_size, -1, num_codebooks,
+                beam_size * alive_batch_size, -1, num_channels,
             )
             # NB* x T x K x C
             logits, alive_hidden_states = decoder(
@@ -441,11 +542,11 @@ def _beam_search(
                 dtype=torch.long,
                 device=alive_hyps.device,
             )
-            bos_idx = bos_idx[:, None, None].expand(
-                -1, alive_hyps.shape[-2], num_codebooks
-            )
-            lm_log_probs = lm(
+            bos_idx = bos_idx[:, None, None].expand(-1, -1, num_channels)
+            lm_log_probs, lm_hidden_states, lm_offset = lm(
                 torch.cat([bos_idx, alive_hyps[:, 1:]], dim=-2),  # NB* x T x K
+                lm_hidden_states,
+                lm_offset,
             )
             # NB* x K x C or B* x K x C (num_gen_tokens=0)
             lm_log_probs = lm_log_probs[:, -1]
@@ -475,12 +576,17 @@ def _beam_search(
             )
             if alive_hidden_states is not None:
                 # : x NB* x ...
-                alive_hidden_states = tuple(
+                alive_hidden_states = [
                     x.expand(beam_size, *x.shape)
                     .movedim(0, 1)
                     .reshape(-1, beam_size * hyps.shape[1], *x.shape[2:])
                     for x in alive_hidden_states
-                )
+                ]
+            if lm_hidden_states is not None:
+                lm_hidden_states = [
+                    x.expand(beam_size, *x.shape).reshape(-1, *x.shape[1:])
+                    for x in lm_hidden_states
+                ]
         else:
             # N x B* x K x C
             log_probs = log_probs.reshape(
@@ -500,11 +606,11 @@ def _beam_search(
             gen_token_ids = gen_token_ids.movedim(-1, 1)
             # NN x B* x K
             gen_token_ids = gen_token_ids.reshape(
-                -1, alive_batch_size, num_codebooks
+                -1, alive_batch_size, num_channels
             )
             # N x B* x K
             gen_token_ids = gen_token_ids.gather(
-                0, alive_hyp_idxes[..., None].expand(-1, -1, num_codebooks)
+                0, alive_hyp_idxes[..., None].expand(-1, -1, num_channels)
             )
             # N x B*
             alive_hyp_idxes //= beam_size
@@ -614,6 +720,14 @@ def _beam_search(
                         ].reshape(x.shape[0], -1, *x.shape[2:])
                         for x in alive_hidden_states
                     ]
+                if lm_hidden_states is not None:
+                    # NB* x ...
+                    lm_hidden_states = [
+                        x.reshape(beam_size, -1, *x.shape[1:])[
+                            :, alive_mask_unchanged
+                        ].reshape(-1, *x.shape[1:])
+                        for x in lm_hidden_states
+                    ]
     # N x B x T x K
     final_hyps = final_hyps[
         :, :, _NUM_SPECIAL_TOKENS : num_gen_tokens + _NUM_SPECIAL_TOKENS
@@ -632,7 +746,7 @@ def _beam_search(
         final_hyps.reshape(batch_size * beam_size, -1)[
             final_score_idxes.movedim(0, 1)
         ]
-        .reshape(beam_size, batch_size, -1, num_codebooks)
+        .reshape(beam_size, batch_size, -1, num_channels)
         .movedim(0, 1)
     )
     return final_hyps, final_scores

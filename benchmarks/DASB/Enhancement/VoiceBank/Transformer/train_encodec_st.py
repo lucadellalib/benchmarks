@@ -47,34 +47,29 @@ class Enhancement(sb.Brain):
             torch.cat([in_sig, out_sig]),
             torch.cat([in_sig_lens, out_sig_lens]),
         )
-        tokens, _ = self.modules.codec.encode(sig, lens)
+        with torch.no_grad():
+            self.hparams.codec.to(self.device).eval()
+            tokens = self.hparams.codec.encode(sig, lens)[0]
         in_tokens = tokens[: len(tokens) // 2]
         batch.out_tokens = tokens[len(tokens) // 2 :], out_sig_lens
 
-        # Forward embedding layer (one for each codebook)
-        in_tokens += torch.arange(
-            0,
-            self.hparams.num_codebooks * self.hparams.vocab_size,
-            self.hparams.vocab_size,
-            device=self.device,
-        )  # Offset to select embeddings from the correct codebook
-        in_embs = (
-            self.modules.embedding(in_tokens)
-            .reshape(
-                len(batch),
-                -1,
-                self.hparams.embedding_dim,
-                self.hparams.num_codebooks,
-            )
-            .sum(dim=-1)
-        )
-
         # Forward encoder
-        enc_out = self.modules.encoder.encode(in_embs, in_sig_lens)
-        enc_out = self.modules.encoder_proj(enc_out)
+        enc_out = self.modules.st_encoder(in_tokens, in_sig_lens)
 
-        # Forward embedding layer (one for each codebook)
-        out_tokens, out_tokens_bos_lens = batch.out_tokens
+        # Generate BOS tokens via teacher forcing if specified
+        if (
+            stage == sb.Stage.TRAIN
+            and current_epoch > self.hparams.teacher_forcing_after_epoch
+        ):
+            with torch.no_grad():
+                hyps = self.hparams.greedy_searcher(
+                    enc_out, torch.ones(len(enc_out), device=self.device)
+                )
+            out_tokens = hyps
+        else:
+            out_tokens, _ = batch.out_tokens
+
+        # Forward decoder
         out_tokens_bos = torch.cat(
             [
                 torch.full(
@@ -86,35 +81,8 @@ class Enhancement(sb.Brain):
             ],
             dim=-2,
         )
-        out_tokens_bos += torch.arange(
-            0,
-            self.hparams.num_codebooks * self.hparams.vocab_size,
-            self.hparams.vocab_size,
-            device=self.device,
-        )  # Offset to select embeddings from the correct codebook
-        out_embs_bos = (
-            self.modules.embedding(out_tokens_bos)
-            .reshape(
-                len(batch),
-                -1,
-                self.hparams.embedding_dim,
-                self.hparams.num_codebooks,
-            )
-            .sum(dim=-1)
-        )
-
-        # Forward decoder
-        dec_out, _ = self.modules.decoder(
-            out_embs_bos, lengths=out_tokens_bos_lens
-        )
-        dec_out = self.modules.decoder_proj(dec_out)
-
-        # Forward joiner
-        join_out = self.modules.joiner(enc_out, dec_out)
-
-        # Compute cross-entropy logits (one for each codebook)
-        ce_logits = self.modules.ce_head(join_out).reshape(
-            len(batch), -1, self.hparams.num_codebooks, self.hparams.vocab_size,
+        ce_logits, *_ = self.modules.st_decoder(
+            enc_out, out_tokens_bos, in_sig_lens
         )
 
         # Compute outputs
@@ -137,6 +105,7 @@ class Enhancement(sb.Brain):
                     if stage == sb.Stage.TEST
                     else self.hparams.greedy_searcher
                 )(enc_out, in_sig_lens)
+
             hyps = hyps.flatten(start_dim=-2).tolist()
 
             # Remove padding (output length is equal to input length)
@@ -248,6 +217,17 @@ class Enhancement(sb.Brain):
         from dnsmos import DNSMOS
         from dwer import DWER
 
+        if self.hparams.use_vocos:
+            from speechbrain.lobes.models.huggingface_transformers.vocos import (
+                Vocos,
+            )
+
+            vocos = Vocos(
+                source="charactr/vocos-encodec-24khz",
+                bandwidth=self.hparams.bandwidth,
+                save_path=self.hparams.save_folder,
+            )
+
         IDs = []
         sisnrs = []
         dnsmoses = []
@@ -275,8 +255,15 @@ class Enhancement(sb.Brain):
                 rec_tokens, device=self.device
             ).reshape(-1, self.hparams.num_codebooks)
 
-            hyp_sig = self.modules.codec.decode(hyp_tokens[None])[0, 0]
-            rec_sig = self.modules.codec.decode(rec_tokens[None])[0, 0]
+            with torch.no_grad():
+                if self.hparams.use_vocos:
+                    vocos.to(self.device).eval()
+                    hyp_sig = vocos(hyp_tokens[None], torch.tensor([1.0]))[0][0]
+                    rec_sig = vocos(rec_tokens[None], torch.tensor([1.0]))[0][0]
+                else:
+                    self.hparams.codec.to(self.device).eval()
+                    hyp_sig = self.hparams.codec.decode(hyp_tokens[None])[0, 0]
+                    rec_sig = self.hparams.codec.decode(rec_tokens[None])[0, 0]
             ref_sig = self.test_set[self.test_set.data_ids.index(ID)][
                 "out_sig"
             ].to(
