@@ -3,7 +3,7 @@
 # Authors: Luca Della Libera 2023
 # ############################################################################
 
-experiment_name: encodec_st1
+experiment_name: encodec_st_conv
 
 # Seed needs to be set at top of YAML
 seed: 0
@@ -36,7 +36,6 @@ sorting: ascending
 
 # Training parameters
 num_epochs: 10
-teacher_forcing_after_epoch: !ref <num_epochs>
 grad_accumulation_factor: 1
 dynamic_batching: False
 train_batch_size: 16
@@ -55,8 +54,8 @@ ckpt_interval_minutes: 600
 keep_checkpoints: 2
 augment: True
 augment_prob: 0.75
-use_pit: False  # Set to True to use permutation invariant loss
 snr: 5  # dB  # Used only if `add_noise` is True
+teacher_forcing_until_epoch: !ref <num_epochs>
 
 # Optimizer parameters
 lr: 0.0005
@@ -81,8 +80,6 @@ bos_index: !ref <vocab_size>
 
 # Encoder parameters
 embedding_dim: 128  # NOTE: if using pretrained embeddings, must match EnCodec's embedding size
-freeze_embeddings: False
-use_pretrained_embeddings: False
 dropout: 0.1
 activation: !name:torch.nn.GELU
 d_model: 256
@@ -91,6 +88,9 @@ num_layers: 6
 d_ffn: 2048
 max_length: 5000
 encoder_module: conformer
+causal: True
+freeze_embeddings: False
+use_pretrained_embeddings: True
 
 # Decoder parameters
 rnn_neurons: 512
@@ -102,7 +102,8 @@ joint_dim: 640
 # Search parameters
 valid_search_freq: 1
 use_teacher_forcing: False
-beam_size: 10
+beam_size: 1
+lm_weight: 0.0
 has_hidden_state: False
 
 # Augmentation
@@ -140,6 +141,12 @@ codec: !new:speechbrain.lobes.models.huggingface_transformers.encodec.Encodec
     freeze: True
     renorm_embeddings: False
 
+# Pretrained simplified transducer decoder path
+st_decoder_path: null
+
+# Pretrained language model
+lm: null
+
 encoder_embedding: !new:torch.nn.Embedding
     num_embeddings: !ref <vocab_size> * <num_codebooks>
     embedding_dim: !ref <embedding_dim>
@@ -157,31 +164,42 @@ encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
     max_length: !ref <max_length>
     encoder_module: !ref <encoder_module>
     normalize_before: True
-    causal: True
+    causal: !ref <causal>
 
 encoder_proj: !new:torch.nn.Linear
     in_features: !ref <d_model>
     out_features: !ref <joint_dim>
 
-decoder_embedding1: !new:torch.nn.Embedding
+decoder_embedding: !new:torch.nn.Embedding
     num_embeddings: !ref (<vocab_size> + <num_speakers>) * <num_codebooks>
     embedding_dim: !ref <embedding_dim>
 
-decoder1: !new:speechbrain.nnet.RNN.LSTM
+decoder: !new:speechbrain.lobes.models.CRDNN.CRDNN
     input_shape: [null, null, !ref <embedding_dim>]
-    hidden_size: !ref <rnn_neurons>
-    num_layers: !ref <rnn_num_layers>
+    activation: !ref <activation>
+    dropout: !ref <dropout>
+    cnn_blocks: 2
+    cnn_channels: (32, 32)
+    cnn_kernelsize: (5, 5)
+    inter_layer_pooling_size: (1, 1)
+    time_pooling: True
+    using_2d_pooling: False
+    time_pooling_size: 1
+    freq_pooling_size: 1
+    rnn_layers: 0
+    dnn_blocks: 0
+    rnn_re_init: True
 
-decoder_proj1: !new:torch.nn.Linear
-    in_features: !ref <rnn_neurons>
+decoder_proj: !new:torch.nn.Linear
+    in_features: 128
     out_features: !ref <joint_dim>
 
-joiner1: !new:speechbrain.nnet.transducer.transducer_joint.Transducer_joint
+joiner: !new:speechbrain.nnet.transducer.transducer_joint.Transducer_joint
     joint: sum
 
-ce_head1: !new:speechbrain.nnet.linear.Linear
-    input_size: !ref <joint_dim>
-    n_neurons: !ref <vocab_size> * <num_codebooks>
+ce_head: !new:torch.nn.Linear
+    in_features: !ref <joint_dim>
+    out_features: !ref <vocab_size> * <num_codebooks>
 
 # Simplified transducer
 st_encoder: !new:st.SimplifiedTransducerEncoder
@@ -189,21 +207,21 @@ st_encoder: !new:st.SimplifiedTransducerEncoder
     encoder: !ref <encoder>
     encoder_proj: !ref <encoder_proj>
 
-st_decoder1: !new:st.SimplifiedTransducerDecoder
-    embedding: !ref <decoder_embedding1>
-    decoder: !ref <decoder1>
-    decoder_proj: !ref <decoder_proj1>
-    joiner: !ref <joiner1>
-    head: !ref <ce_head1>
+st_decoder: !new:st_conv.SimplifiedTransducerDecoder
+    embedding: !ref <decoder_embedding>
+    decoder: !ref <decoder>
+    decoder_proj: !ref <decoder_proj>
+    joiner: !ref <joiner>
+    head: !ref <ce_head>
     has_hidden_state: !ref <has_hidden_state>
 
 modules:
     st_encoder: !ref <st_encoder>
-    st_decoder1: !ref <st_decoder1>
+    st_decoder: !ref <st_decoder>
 
 model: !new:torch.nn.ModuleList
     [[!ref <st_encoder>,
-      !ref <st_decoder1>]]
+      !ref <st_decoder>]]
 
 # Loss functions
 ce_loss: !name:speechbrain.nnet.losses.nll_loss
@@ -226,27 +244,14 @@ scheduler: !new:speechbrain.nnet.schedulers.NewBobScheduler
     patient: !ref <patient>
 
 # Searchers
-greedy_searcher1: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index>
+greedy_searcher: !new:st.SimplifiedTransducerSearcher
+    st_decoder: !ref <st_decoder>
 
-beam_searcher1: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index>
+beam_searcher: !new:st.SimplifiedTransducerSearcher
+    st_decoder: !ref <st_decoder>
     beam_size: !ref <beam_size>
-
-greedy_searcher2: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index> + 1
-
-beam_searcher2: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index> + 1
-    beam_size: !ref <beam_size>
+    lm: !ref <lm>
+    lm_weight: !ref <lm_weight>
 
 # Performance metrics
 ter_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
@@ -264,3 +269,13 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
 
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <output_folder>/train_log.txt
+
+# Pretrainer
+pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
+    collect_in: !ref <save_folder>
+    loadables:
+        st_decoder: !ref <st_decoder>
+    paths:
+        st_decoder: !ref <st_decoder_path>
+    conditions:
+        st_decoder: !ref <st_decoder_path>

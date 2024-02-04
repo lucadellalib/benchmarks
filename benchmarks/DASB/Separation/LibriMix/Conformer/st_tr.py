@@ -23,7 +23,7 @@ class SimplifiedTransducerEncoder(torch.nn.Module):
 
     Arguments
     ---------
-    embedding : torch.nn.Module
+    embedding : torch.nn.Embedding
         The embedding layer.
     encoder : torch.nn.Module
         The encoder module.
@@ -72,9 +72,7 @@ class SimplifiedTransducerEncoder(torch.nn.Module):
         # Forward embedding layer (one for each channel)
         embs = (
             self.embedding(tokens)
-            .reshape(
-                batch_size, -1, self.embedding.embedding_dim, num_channels,
-            )
+            .reshape(batch_size, tokens.shape[1], -1, num_channels,)
             .sum(dim=-1)
         )
 
@@ -102,7 +100,7 @@ class SimplifiedTransducerDecoder(torch.nn.Module):
 
     Arguments
     ---------
-    embedding : torch.nn.Module
+    embedding : torch.nn.Embedding
         The embedding layer.
     decoder : torch.nn.Module
         The decoder module.
@@ -131,7 +129,7 @@ class SimplifiedTransducerDecoder(torch.nn.Module):
         decoder,
         decoder_proj,
         joiner,
-        head=None,
+        head,
         has_hidden_state=False,
     ):
         super().__init__()
@@ -161,15 +159,14 @@ class SimplifiedTransducerDecoder(torch.nn.Module):
         Returns
         -------
         torch.Tensor
-            If `head` is provided, the logits, shape: ``[batch_size, seq_length, num_channels, vocab_size]``,
-            else the joiner hidden states, shape: ``[batch_size, seq_length, joint_dim]``.
+            The logits, shape: ``[batch_size, seq_length, num_channels, vocab_size]``.
         Sequence[torch.Tensor]
             The decoder hidden state, shape of the i-th tensor: ``[:, batch_size, ...]``.
 
         """
         batch_size = tokens_bos.shape[0]
         num_channels = tokens_bos.shape[-1]
-        vocab_size = self.embedding.num_embeddings // num_channels - 2
+        vocab_size = self.embedding.num_embeddings // num_channels
 
         # Offset to select embeddings from the correct channel
         tokens_bos = tokens_bos + torch.arange(  # Copy to avoid side effects
@@ -179,9 +176,7 @@ class SimplifiedTransducerDecoder(torch.nn.Module):
         # Forward embedding layer (one for each channel)
         embs_bos = (
             self.embedding(tokens_bos)
-            .reshape(
-                batch_size, -1, self.embedding.embedding_dim, num_channels,
-            )
+            .reshape(batch_size, tokens_bos.shape[1], -1, num_channels)
             .sum(dim=-1)
         )
 
@@ -193,19 +188,15 @@ class SimplifiedTransducerDecoder(torch.nn.Module):
             )
         else:
             hidden_state = None
-            dec_out = self.decoder(embs_bos, lengths=enc_out_lens)[0]
+            dec_out = self.decoder.encode(embs_bos, enc_out_lens)
         dec_out = self.decoder_proj(dec_out)
 
         # Forward joiner
         join_out = self.joiner(enc_out, dec_out)
 
-        # If no head is provided, return joiner output
-        if self.head is None:
-            return join_out, hidden_state
-
         # Compute cross-entropy logits (one for each channel)
         logits = self.head(join_out).reshape(
-            batch_size, -1, num_channels, vocab_size,
+            batch_size, join_out.shape[1], num_channels, -1,
         )
 
         return logits, hidden_state
@@ -218,46 +209,31 @@ class SimplifiedTransducerSearcher(torch.nn.Module):
     ---------
     st_decoder : SimplifiedTransducerDecoder
         A simplified transducer decoder.
-    num_channels : int
-        The number of channels.
-    bos_id : int
-        The BOS index.
     beam_size : int
         The beam size. Greedy search is used if `beam_size` is 1,
         beam search otherwise.
     lm : torch.nn.Module
         A module that receives as input the transcription tokens (shape: ``[batch_size, seq_length, num_channels]``)
-        and returns the next log probabilities (shape: ``[batch_size, seq_length, num_channels, vocab_size]``)
+        and the hidden states (shape of the i-th tensor: ``[:, batch_size, ...]``), and returns the next log
+        probabilities (shape: ``[batch_size, seq_length, num_channels, vocab_size]``) and hidden states
+        (shape of the i-th tensor: ``[:, batch_size, ...]``)
         (used only if `beam_size` > 1).
     lm_weight : float
         The language model weight
-        (used only if `beam_size` > 1 and a language model is provided).
-    lm_bos_id : int
-        The language model BOS index.
         (used only if `beam_size` > 1 and a language model is provided).
 
     """
 
     def __init__(
-        self,
-        st_decoder,
-        num_channels,
-        bos_id,
-        beam_size=1,
-        lm=None,
-        lm_weight=0.0,
-        lm_bos_id=0,
+        self, st_decoder, beam_size=1, lm=None, lm_weight=0.0,
     ):
         super().__init__()
         self.st_decoder = st_decoder
-        self.num_channels = num_channels
-        self.bos_id = bos_id
         self.beam_size = beam_size
         self.lm = lm
         self.lm_weight = lm_weight
-        self.lm_bos_id = lm_bos_id
 
-    def forward(self, enc_out, enc_out_lens):
+    def forward(self, enc_out, enc_out_lens, bos_id):
         """Generate a transcription.
 
         Arguments
@@ -266,23 +242,23 @@ class SimplifiedTransducerSearcher(torch.nn.Module):
             The encoder hidden states, shape: ``[batch_size, seq_length, d_model]``
         enc_out_lens : torch.Tensor
             The relative lengths of the encoder hidden states, shape: ``[batch_size]``.
+        bos_id : torch.LongTensor
+            The BOS index, shape: ``[batch_size, num_channels]``.
 
         Returns
         -------
         torch.LongTensor
-            The hypotheses, shape: ``[batch_size, seq_length]``
+            The hypotheses, shape: ``[batch_size, seq_length]``.
 
         """
         hyps, _ = generate(
             self.st_decoder,
             enc_out,
             enc_out_lens,
-            self.num_channels,
-            self.bos_id,
+            bos_id,
             self.beam_size,
             self.lm,
             self.lm_weight,
-            self.lm_bos_id,
         )
         return hyps
 
@@ -293,70 +269,17 @@ def generate(
     decoder,
     audio_features,
     audio_features_lens,
-    num_channels,
     bos_id,
     beam_size=1,
     lm=None,
     lm_weight=0.0,
-    lm_bos_id=0,
     return_all=False,
 ):
-    """Generate a transcription via greedy or beam search.
-
-    Arguments
-    ---------
-    decoder : torch.nn.Module
-        A module that receives as input the audio features (shape: ``[batch_size, seq_length, hidden_size]``),
-        the transcription tokens (shape: ``[batch_size, seq_length, num_channels]``),
-        and their relative lengths (shape: ``[batch_size]``),
-        and returns the corresponding logits (shape: ``[batch_size, seq_length, num_channels, vocab_size]``).
-    audio_features : torch.Tensor
-        A batch of audio features, shape: ``[batch_size, seq_length, hidden_size]``
-    audio_features_lens : torch.Tensor
-        The relative lengths of the audio features, shape: ``[batch_size]``.
-    num_channels : int
-        The number of channels.
-    bos_id : int
-        The BOS index.
-    beam_size : int
-        The beam size. Greedy search is used if `beam_size` is 1,
-        beam search otherwise.
-    lm : torch.nn.Module
-        A module that receives as input the transcription tokens (shape: ``[batch_size, seq_length, num_channels]``)
-        and returns the next log probabilities (shape: ``[batch_size, seq_length, num_channels, vocab_size]``)
-        (used only if `beam_size` > 1).
-    lm_weight : float
-        The language model weight
-        (used only if `beam_size` > 1 and a language model is provided).
-    lm_bos_id : int
-        The language model BOS index.
-        (used only if `beam_size` > 1 and a language model is provided).
-    return_all : bool
-        True to return all the hypotheses (`beam_size` for each batch element),
-        False to return only the one with the highest score.
-
-    Returns
-    -------
-    torch.LongTensor
-        The batch of hypotheses, shape: ``[batch_size, beam_size, seq_length]``
-        if `return_all` is True, ``[batch_size, seq_length]`` otherwise.
-    torch.Tensor
-        The batch of scores, shape: ``[batch_size, beam_size]``
-        if `return_all` is True, ``[batch_size]`` otherwise.
-
-    Raises
-    ------
-    ValueError:
-        If an invalid argument value is given.
-
-    """
-    batch_size = audio_features.shape[0]
     max_gen_tokens = audio_features.shape[1]
-    hyps = torch.full(
-        (batch_size, max_gen_tokens + _NUM_SPECIAL_TOKENS, num_channels),
-        bos_id,
-        dtype=torch.long,
-        device=audio_features.device,
+    hyps = (
+        bos_id[:, None]
+        .expand(-1, max_gen_tokens + _NUM_SPECIAL_TOKENS, -1)
+        .clone()
     )
 
     if beam_size > 1:
@@ -368,7 +291,6 @@ def generate(
             beam_size,
             lm,
             lm_weight,
-            lm_bos_id,
         )
         if not return_all:
             hyps, scores = hyps[:, 0], scores[:, 0]
@@ -414,7 +336,15 @@ def _greedy_search(
         alive_hyps = hyps[alive_mask, : num_gen_tokens + _NUM_SPECIAL_TOKENS]
         # B* x T x K x C
         logits, alive_hidden_states = decoder(
-            alive_audio_features[:, : num_gen_tokens + _NUM_SPECIAL_TOKENS],
+            alive_audio_features[
+                :,
+                (
+                    0
+                    if alive_hidden_states is None
+                    else num_gen_tokens + _NUM_SPECIAL_TOKENS - 1
+                ) : num_gen_tokens
+                + _NUM_SPECIAL_TOKENS,
+            ],
             alive_hyps if alive_hidden_states is None else alive_hyps[:, -1:],
             hidden_state=alive_hidden_states,
         )
@@ -461,7 +391,6 @@ def _beam_search(
     beam_size=2,  # N
     lm=None,
     lm_weight=0.0,
-    lm_bos_id=0,
 ):
     batch_size = audio_features.shape[0]
     num_channels = hyps.shape[-1]
@@ -490,7 +419,6 @@ def _beam_search(
     # : x B* x ...
     alive_hidden_states = None
     lm_hidden_states = None
-    lm_offset = 0
     # Autoregressive loop
     while True:
         if num_gen_tokens == 0:
@@ -502,10 +430,7 @@ def _beam_search(
             # B* x T x K x C
             logits, alive_hidden_states = decoder(
                 alive_audio_features[:, : num_gen_tokens + _NUM_SPECIAL_TOKENS],
-                alive_hyps
-                if alive_hidden_states is None
-                else alive_hyps[:, -1:],
-                hidden_state=alive_hidden_states,
+                alive_hyps,
             )
         else:
             # N x B* x T x K
@@ -518,7 +443,15 @@ def _beam_search(
             )
             # NB* x T x K x C
             logits, alive_hidden_states = decoder(
-                alive_audio_features[:, : num_gen_tokens + _NUM_SPECIAL_TOKENS],
+                alive_audio_features[
+                    :,
+                    (
+                        0
+                        if alive_hidden_states is None
+                        else num_gen_tokens + _NUM_SPECIAL_TOKENS - 1
+                    ) : num_gen_tokens
+                    + _NUM_SPECIAL_TOKENS,
+                ],
                 alive_hyps
                 if alive_hidden_states is None
                 else alive_hyps[:, -1:],
@@ -535,18 +468,8 @@ def _beam_search(
             lm.eval()
             # Move to correct device
             lm.to(alive_hyps.device)
-            # Set correct BOS index for the language model
-            bos_idx = torch.full(
-                (alive_hyps.shape[0],),
-                lm_bos_id,
-                dtype=torch.long,
-                device=alive_hyps.device,
-            )
-            bos_idx = bos_idx[:, None, None].expand(-1, -1, num_channels)
-            lm_log_probs, lm_hidden_states, lm_offset = lm(
-                torch.cat([bos_idx, alive_hyps[:, 1:]], dim=-2),  # NB* x T x K
-                lm_hidden_states,
-                lm_offset,
+            lm_log_probs, lm_hidden_states = lm(
+                alive_hyps, lm_hidden_states,  # NB* x T x K
             )
             # NB* x K x C or B* x K x C (num_gen_tokens=0)
             lm_log_probs = lm_log_probs[:, -1]

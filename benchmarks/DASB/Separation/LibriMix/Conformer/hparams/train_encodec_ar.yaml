@@ -1,9 +1,9 @@
 # ############################################################################
-# Model: Simplified transducer transformer with EnCodec audio representations (see https://arxiv.org/abs/2210.13438)
+# Model: Autoregressive transformer with EnCodec audio representations (see https://arxiv.org/abs/2210.13438)
 # Authors: Luca Della Libera 2023
 # ############################################################################
 
-experiment_name: encodec_st1
+experiment_name: encodec_ar
 
 # Seed needs to be set at top of YAML
 seed: 0
@@ -36,12 +36,11 @@ sorting: ascending
 
 # Training parameters
 num_epochs: 10
-teacher_forcing_after_epoch: !ref <num_epochs>
 grad_accumulation_factor: 1
 dynamic_batching: False
-train_batch_size: 16
-valid_batch_size: 16
-test_batch_size: 16
+train_batch_size: 4
+valid_batch_size: 4
+test_batch_size: 4
 train_max_batch_length: 40.0  # Seconds
 valid_max_batch_length: 40.0  # Seconds
 test_max_batch_length: 40.0  # Seconds
@@ -49,17 +48,16 @@ num_buckets: 40
 max_batch_size: 128
 dataloader_workers: 4
 nonfinite_patience: 10
-max_grad_norm: 5.0
+max_grad_norm: 0.001
 precision: fp16
 ckpt_interval_minutes: 600
 keep_checkpoints: 2
 augment: True
 augment_prob: 0.75
-use_pit: False  # Set to True to use permutation invariant loss
 snr: 5  # dB  # Used only if `add_noise` is True
 
 # Optimizer parameters
-lr: 0.0005
+lr: 0.0001
 weight_decay: 0.01
 improvement_threshold: 0.0025
 annealing_factor: 0.9
@@ -78,32 +76,27 @@ num_codebooks: 2
 
 # Special tokens
 bos_index: !ref <vocab_size>
+eos_index: !ref <vocab_size> + 1
+pad_index: !ref <vocab_size> + 2
 
 # Encoder parameters
 embedding_dim: 128  # NOTE: if using pretrained embeddings, must match EnCodec's embedding size
-freeze_embeddings: False
-use_pretrained_embeddings: False
 dropout: 0.1
 activation: !name:torch.nn.GELU
 d_model: 256
 nhead: 8
-num_layers: 6
-d_ffn: 2048
+num_encoder_layers: 4
+num_decoder_layers: 4
+d_ffn: 512
 max_length: 5000
 encoder_module: conformer
-
-# Decoder parameters
-rnn_neurons: 512
-rnn_num_layers: 4
-
-# Joiner parameters
-joint_dim: 640
+causal: False
+freeze_embeddings: False
+use_pretrained_embeddings: True
 
 # Search parameters
 valid_search_freq: 1
-use_teacher_forcing: False
-beam_size: 10
-has_hidden_state: False
+beam_size: 1
 
 # Augmentation
 drop_freq: !new:speechbrain.augment.time_domain.DropFreq
@@ -140,70 +133,37 @@ codec: !new:speechbrain.lobes.models.huggingface_transformers.encodec.Encodec
     freeze: True
     renorm_embeddings: False
 
-encoder_embedding: !new:torch.nn.Embedding
-    num_embeddings: !ref <vocab_size> * <num_codebooks>
+embedding: !new:torch.nn.Embedding
+    num_embeddings: !ref <vocab_size> + 3
     embedding_dim: !ref <embedding_dim>
+    padding_idx: !ref <vocab_size> + 2
 
-encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
+transformer: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
     input_size: !ref <embedding_dim>
-    tgt_vocab: !ref <vocab_size>
+    tgt_vocab: !ref <vocab_size> + 3
     d_model: !ref <d_model>
     nhead: !ref <nhead>
-    num_encoder_layers: !ref <num_layers>
-    num_decoder_layers: 0
+    num_encoder_layers: !ref <num_encoder_layers>
+    num_decoder_layers: !ref <num_decoder_layers>
     d_ffn: !ref <d_ffn>
     dropout: !ref <dropout>
     activation: !ref <activation>
     max_length: !ref <max_length>
     encoder_module: !ref <encoder_module>
     normalize_before: True
-    causal: True
+    causal: !ref <causal>
 
-encoder_proj: !new:torch.nn.Linear
-    in_features: !ref <d_model>
-    out_features: !ref <joint_dim>
-
-decoder_embedding1: !new:torch.nn.Embedding
-    num_embeddings: !ref (<vocab_size> + <num_speakers>) * <num_codebooks>
-    embedding_dim: !ref <embedding_dim>
-
-decoder1: !new:speechbrain.nnet.RNN.LSTM
-    input_shape: [null, null, !ref <embedding_dim>]
-    hidden_size: !ref <rnn_neurons>
-    num_layers: !ref <rnn_num_layers>
-
-decoder_proj1: !new:torch.nn.Linear
-    in_features: !ref <rnn_neurons>
-    out_features: !ref <joint_dim>
-
-joiner1: !new:speechbrain.nnet.transducer.transducer_joint.Transducer_joint
-    joint: sum
-
-ce_head1: !new:speechbrain.nnet.linear.Linear
-    input_size: !ref <joint_dim>
-    n_neurons: !ref <vocab_size> * <num_codebooks>
-
-# Simplified transducer
-st_encoder: !new:st.SimplifiedTransducerEncoder
-    embedding: !ref <encoder_embedding>
-    encoder: !ref <encoder>
-    encoder_proj: !ref <encoder_proj>
-
-st_decoder1: !new:st.SimplifiedTransducerDecoder
-    embedding: !ref <decoder_embedding1>
-    decoder: !ref <decoder1>
-    decoder_proj: !ref <decoder_proj1>
-    joiner: !ref <joiner1>
-    head: !ref <ce_head1>
-    has_hidden_state: !ref <has_hidden_state>
+ce_head: !new:speechbrain.nnet.linear.Linear
+    input_size: !ref <d_model>
+    n_neurons: !ref <vocab_size> + 3
 
 modules:
-    st_encoder: !ref <st_encoder>
-    st_decoder1: !ref <st_decoder1>
+    embedding: !ref <embedding>
+    transformer: !ref <transformer>
+    ce_head: !ref <ce_head>
 
 model: !new:torch.nn.ModuleList
-    [[!ref <st_encoder>,
-      !ref <st_decoder1>]]
+    [[!ref <embedding>, !ref <transformer>, !ref <ce_head>]]
 
 # Loss functions
 ce_loss: !name:speechbrain.nnet.losses.nll_loss
@@ -226,26 +186,19 @@ scheduler: !new:speechbrain.nnet.schedulers.NewBobScheduler
     patient: !ref <patient>
 
 # Searchers
-greedy_searcher1: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index>
+greedy_searcher: !new:speechbrain.decoders.S2STransformerGreedySearch
+    modules: [!ref <transformer>, !ref <ce_head>]
+    bos_index: !ref <bos_index>
+    eos_index: !ref <eos_index>
+    min_decode_ratio: 0.0
+    max_decode_ratio: 1.0
 
-beam_searcher1: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index>
-    beam_size: !ref <beam_size>
-
-greedy_searcher2: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index> + 1
-
-beam_searcher2: !new:st.SimplifiedTransducerSearcher
-    st_decoder: !ref <st_decoder1>
-    num_channels: !ref <num_codebooks>
-    bos_id: !ref <bos_index> + 1
+beam_searcher: !new:speechbrain.decoders.S2STransformerBeamSearcher
+    modules: [!ref <transformer>, !ref <ce_head>]
+    bos_index: !ref <bos_index>
+    eos_index: !ref <eos_index>
+    min_decode_ratio: 0.0
+    max_decode_ratio: 1.0
     beam_size: !ref <beam_size>
 
 # Performance metrics
