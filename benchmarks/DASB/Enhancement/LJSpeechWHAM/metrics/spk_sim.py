@@ -1,7 +1,7 @@
 """Cosine similarity between speaker embeddings.
 
 Authors
-* Luca Della Libera 2024
+ * Luca Della Libera 2024
 """
 
 import os
@@ -91,7 +91,9 @@ root_folder = os.path.dirname(os.path.realpath(__file__))
 save_path = os.path.join(root_folder, "huggingface")
 
 SpkSimECAPATDNN = ComputeScoreECAPATDNN(
-    "speechbrain/spkrec-ecapa-voxceleb", save_path, SAMPLING_RATE
+    "speechbrain/spkrec-ecapa-voxceleb",
+    os.path.join(save_path, "models--speechbrain--spkrec-ecapa-voxceleb"),
+    SAMPLING_RATE,
 )
 SpkSimWavLM = ComputeScoreWavLM(
     "microsoft/wavlm-base-sv", save_path, SAMPLING_RATE

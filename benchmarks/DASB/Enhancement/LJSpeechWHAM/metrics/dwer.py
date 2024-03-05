@@ -1,7 +1,7 @@
 """Differential WER (dWER) (see https://arxiv.org/abs/1911.07953).
 
 Authors
-* Luca Della Libera 2024
+ * Luca Della Libera 2024
 """
 
 import os

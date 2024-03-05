@@ -1,9 +1,9 @@
 ﻿# ############################################################################
-# Model: CRDNN with HuBERT semantic tokens (K-means: LibriSpeech, vocoder: LJSpeech)
+# Model: Transformer with WavLM semantic tokens (K-means: LJSpeech, vocoder: LJSpeech)
 # Authors: Luca Della Libera 2024
 # ############################################################################
 
-experiment_name: crdnn_hubert_librispeech_ljspeech
+experiment_name: discrete_wavlm_ljspeech_ljspeech_transformer
 
 # Seed needs to be set at top of YAML
 seed: 4321
@@ -48,7 +48,7 @@ nonfinite_patience: 10
 max_grad_norm: 5.0
 precision: fp16
 ckpt_interval_minutes: 60
-keep_checkpoints: 2
+keep_checkpoints: 4
 augment: True
 augment_prob: 0.75
 
@@ -65,24 +65,19 @@ sample_rate: 16000
 vocab_size: 1000
 layer_ids: [3, 7, 12, 18, 23]
 num_codebooks: 5
-kmeans_dataset: LibriSpeech-100-360-500
-vocoder_source: chaanks/hifigan-unit-hubert-ll60k-l3-7-12-18-23-k1000-librispeech-ljspeech
+kmeans_dataset: LJSpeech
+vocoder_source: chaanks/hifigan-unit-wavlm-l3-7-12-18-23-k1000-ljspeech-ljspeech
 
 # Encoder parameters
 embedding_dim: 256
 dropout: 0.1
-activation: !name:torch.nn.LeakyReLU
-rnn_class: !name:speechbrain.nnet.RNN.LSTM
-rnn_layers: 4
-time_pooling_size: 1
-rnn_bidirectional: True
-rnn_neurons: 256
-dnn_blocks: 2
-dnn_neurons: 256
-cnn_blocks: 2
-cnn_channels: (16, 16)
-inter_layer_pooling_size: (2, 2)
-cnn_kernelsize: (3, 3)
+activation: !name:torch.nn.GELU
+d_model: 256
+nhead: 4
+num_layers: 6
+d_ffn: 2048
+max_length: 5000
+encoder_module: transformer
 
 # Search parameters
 valid_search_freq: 2
@@ -114,8 +109,8 @@ augmentation: !new:speechbrain.augment.augmenter.Augmenter
 # Modules
 # Discrete SSL model
 codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
-    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.hubert.HuBERT
-        source: facebook/hubert-large-ll60k
+    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
+        source: microsoft/wavlm-large
         save_path: !ref <save_folder>
         output_norm: False
         freeze: True
@@ -136,37 +131,38 @@ embedding: !new:torch.nn.Embedding
     num_embeddings: !ref <vocab_size> * <num_codebooks>
     embedding_dim: !ref <embedding_dim>
 
-encoder: !new:speechbrain.lobes.models.CRDNN.CRDNN
-    input_shape: [null, null, !ref <embedding_dim>]
-    activation: !ref <activation>
+attention_mlp: !new:models.AttentionMLP
+    input_dim: !ref <embedding_dim>
+    hidden_dim: !ref <embedding_dim>
+
+encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
+    input_size: !ref <embedding_dim>
+    tgt_vocab: -1
+    d_model: !ref <d_model>
+    nhead: !ref <nhead>
+    num_encoder_layers: !ref <num_layers>
+    num_decoder_layers: 0
+    d_ffn: !ref <d_ffn>
     dropout: !ref <dropout>
-    cnn_blocks: !ref <cnn_blocks>
-    cnn_channels: !ref <cnn_channels>
-    cnn_kernelsize: !ref <cnn_kernelsize>
-    inter_layer_pooling_size: !ref <inter_layer_pooling_size>
-    time_pooling: True
-    using_2d_pooling: False
-    time_pooling_size: !ref <time_pooling_size>
-    rnn_class: !ref <rnn_class>
-    rnn_layers: !ref <rnn_layers>
-    rnn_neurons: !ref <rnn_neurons>
-    rnn_bidirectional: !ref <rnn_bidirectional>
-    dnn_blocks: !ref <dnn_blocks>
-    dnn_neurons: !ref <dnn_neurons>
-    rnn_re_init: True
-    use_rnnp: False
+    activation: !ref <activation>
+    max_length: !ref <max_length>
+    encoder_module: !ref <encoder_module>
+    normalize_before: True
+    causal: False
 
 ce_head: !new:speechbrain.nnet.linear.Linear
-    input_size: !ref <dnn_neurons>
+    input_size: !ref <d_model>
     n_neurons: !ref <vocab_size> * <num_codebooks>
 
 modules:
     embedding: !ref <embedding>
+    attention_mlp: !ref <attention_mlp>
     encoder: !ref <encoder>
     ce_head: !ref <ce_head>
 
 model: !new:torch.nn.ModuleList
     [[!ref <embedding>,
+      !ref <attention_mlp>,
       !ref <encoder>,
       !ref <ce_head>]]
 

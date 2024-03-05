@@ -1,7 +1,7 @@
 """Deep Noise Suppression Mean Opinion Score (DNSMOS) (see https://arxiv.org/abs/2010.15258).
 
 Authors
-* Luca Della Libera 2024
+ * Luca Della Libera 2024
 """
 
 # Adapted from:

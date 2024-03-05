@@ -72,8 +72,15 @@ class Enhancement(sb.Brain):
             self.hparams.num_codebooks,
         )
 
-        # Reduce to 1 channel
-        in_embs = in_embs.sum(dim=-1)
+        # Reduce to 1 channel using attention
+        in_embs = in_embs.movedim(-1, -2)
+        attn_weights = self.modules.attention_mlp(in_embs)
+        in_embs = (attn_weights.movedim(-1, -2) @ in_embs)[..., 0, :]
+
+        if stage == sb.Stage.TEST:
+            self.attn_weights += (
+                attn_weights[..., 0].mean(dim=-2).detach().cpu().tolist()
+            )
 
         # Forward encoder
         if type(self.modules.encoder).__name__ == "CRDNN":
@@ -149,6 +156,8 @@ class Enhancement(sb.Brain):
         """Gets called at the beginning of each epoch."""
         if stage != sb.Stage.TRAIN:
             self.ter_metric = self.hparams.ter_computer()
+        if stage == sb.Stage.TEST:
+            self.attn_weights = []
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of each epoch."""
@@ -197,6 +206,18 @@ class Enhancement(sb.Brain):
                 # Save TER
                 with open(self.hparams.ter_file, "w") as w:
                     self.ter_metric.write_stats(w)
+
+                # Save attention weights
+                with open(
+                    os.path.join(
+                        self.hparams.output_folder, "layer_weight.csv"
+                    ),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    csv_writer = csv.writer(f)
+                    csv_writer.writerows(self.attn_weights)
+
                 # Vocode
                 if self.hparams.vocode:
                     self.vocode()
@@ -205,9 +226,9 @@ class Enhancement(sb.Brain):
         from speechbrain.nnet.loss.si_snr_loss import si_snr_loss
         from tqdm import tqdm
 
-        from dnsmos import DNSMOS
-        from dwer import DWER
-        from spk_sim import SpkSimECAPATDNN, SpkSimWavLM
+        from metrics.dnsmos import DNSMOS
+        from metrics.dwer import DWER
+        from metrics.spk_sim import SpkSimECAPATDNN, SpkSimWavLM
 
         metrics = []
         for score in tqdm(

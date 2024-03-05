@@ -1,9 +1,9 @@
 ﻿# ############################################################################
-# Model: Transformer with WavLM semantic tokens (K-means: LibriSpeech, vocoder: LJSpeech)
+# Model: Transformer with HuBERT semantic tokens (K-means: LJSpeech, vocoder: LJSpeech)
 # Authors: Luca Della Libera 2024
 # ############################################################################
 
-experiment_name: transformer_wavlm_librispeech_ljspeech
+experiment_name: discrete_hubert_ljspeech_ljspeech_transformer
 
 # Seed needs to be set at top of YAML
 seed: 4321
@@ -48,7 +48,7 @@ nonfinite_patience: 10
 max_grad_norm: 5.0
 precision: fp16
 ckpt_interval_minutes: 60
-keep_checkpoints: 2
+keep_checkpoints: 4
 augment: True
 augment_prob: 0.75
 
@@ -65,8 +65,8 @@ sample_rate: 16000
 vocab_size: 1000
 layer_ids: [3, 7, 12, 18, 23]
 num_codebooks: 5
-kmeans_dataset: LibriSpeech-100-360-500
-vocoder_source: chaanks/hifigan-unit-wavlm-l3-7-12-18-23-k1000-librispeech-ljspeech
+kmeans_dataset: LJSpeech
+vocoder_source: chaanks/hifigan-unit-hubert-ll60k-l3-7-12-18-23-k1000-ljspeech-ljspeech
 
 # Encoder parameters
 embedding_dim: 256
@@ -109,8 +109,8 @@ augmentation: !new:speechbrain.augment.augmenter.Augmenter
 # Modules
 # Discrete SSL model
 codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
-    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
-        source: microsoft/wavlm-large
+    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.hubert.HuBERT
+        source: facebook/hubert-large-ll60k
         save_path: !ref <save_folder>
         output_norm: False
         freeze: True
@@ -130,6 +130,10 @@ vocoder: !apply:speechbrain.inference.vocoders.UnitHIFIGAN.from_hparams
 embedding: !new:torch.nn.Embedding
     num_embeddings: !ref <vocab_size> * <num_codebooks>
     embedding_dim: !ref <embedding_dim>
+
+attention_mlp: !new:models.AttentionMLP
+    input_dim: !ref <embedding_dim>
+    hidden_dim: !ref <embedding_dim>
 
 encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
     input_size: !ref <embedding_dim>
@@ -152,11 +156,13 @@ ce_head: !new:speechbrain.nnet.linear.Linear
 
 modules:
     embedding: !ref <embedding>
+    attention_mlp: !ref <attention_mlp>
     encoder: !ref <encoder>
     ce_head: !ref <ce_head>
 
 model: !new:torch.nn.ModuleList
     [[!ref <embedding>,
+      !ref <attention_mlp>,
       !ref <encoder>,
       !ref <ce_head>]]
 
