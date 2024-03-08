@@ -67,10 +67,12 @@ class Enhancement(sb.Brain):
         )  # Offset to select embeddings from the correct codebook
         in_embs = self.modules.embedding(in_tokens).reshape(
             len(batch),
+            in_tokens.shape[1],
             -1,
-            self.hparams.embedding_dim,
             self.hparams.num_codebooks,
         )
+        if "embedding_projection" in self.modules:
+            in_embs = self.modules.embedding_projection(in_embs.movedim(-1, -2)).movedim(-1, -2)
 
         # Reduce to 1 channel using attention
         in_embs = in_embs.movedim(-1, -2)
@@ -500,6 +502,20 @@ if __name__ == "__main__":
 
     # Create the datasets objects and tokenization
     train_data, valid_data, test_data = dataio_prepare(hparams)
+
+    if "embedding_projection" in hparams:
+        i = 0
+        for layer_num, vocabulary in zip(
+            hparams["codec"].ssl_layer_ids, hparams["codec"].vocabularies
+        ):
+            if layer_num not in hparams["layer_ids"]:
+                continue
+            hparams["embedding"].weight.data[
+                i * hparams["vocab_size"] : (i + 1) * hparams["vocab_size"]
+            ].copy_(torch.as_tensor(vocabulary))
+            i += 1
+        if hparams["freeze_embeddings"]:
+            hparams["embedding"].requires_grad_(False)
 
     # Trainer initialization
     brain = Enhancement(
