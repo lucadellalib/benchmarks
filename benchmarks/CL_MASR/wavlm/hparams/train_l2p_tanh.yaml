@@ -83,7 +83,7 @@ wavlm: !new:model.ProgressiveWavLM
 ctc_loss: !name:speechbrain.nnet.losses.ctc_loss
     blank_index: !ref <blank_index>
 
-prompt_pool_tanh: !new:train_l2p.PromptPool
+prompt_pool: !new:train_l2p_tanh.PromptPool
     locales: !ref <new_locales>
     d_prompt: !ref <d_prompt>
 

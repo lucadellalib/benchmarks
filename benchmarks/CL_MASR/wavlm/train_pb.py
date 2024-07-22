@@ -171,6 +171,116 @@ class ASR(sb.Brain):
             if self.checkpointer is not None:
                 self.checkpointer.add_recoverable("optimizer", self.optimizer)
 
+    def fit_batch(self, batch):
+        import time
+        torch.cuda.synchronize()
+        ts = time.time()
+
+        amp = sb.core.AMPConfig.from_name(self.precision)
+        should_step = (self.step % self.grad_accumulation_factor) == 0
+
+        with self.no_sync(not should_step):
+            if self.use_amp:
+                with torch.autocast(
+                    dtype=amp.dtype, device_type=torch.device(self.device).type,
+                ):
+                    outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+                    loss = self.compute_objectives(
+                        outputs, batch, sb.Stage.TRAIN
+                    )
+            else:
+                outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+                loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+
+            scaled_loss = self.scaler.scale(
+                loss / self.grad_accumulation_factor
+            )
+            self.check_loss_isfinite(scaled_loss)
+            scaled_loss.backward()
+
+        # Benchmark time
+        torch.cuda.synchronize()
+        delta_time = time.time() - ts
+        with open(os.path.join(self.hparams.output_folder, "time_benchmark.txt"), "a") as f:
+            f.write(f"{delta_time}\n")
+
+        if should_step:
+            self.optimizers_step()
+
+        self.on_fit_batch_end(batch, outputs, loss, should_step)
+        return loss.detach().cpu()
+
+    def _fit_train(self, train_set, epoch, enable):
+        # Training stage
+        self.on_stage_start(sb.Stage.TRAIN, epoch)
+        self.modules.train()
+        self.zero_grad()
+
+        # Reset nonfinite count to 0 each epoch
+        self.nonfinite_count = 0
+
+        if self.train_sampler is not None and hasattr(
+            self.train_sampler, "set_epoch"
+        ):
+            self.train_sampler.set_epoch(epoch)
+
+        # Time since last intra-epoch checkpoint
+        last_ckpt_time = time.time()
+        steps_since_ckpt = 0
+        with sb.core.tqdm(
+            train_set,
+            initial=self.step,
+            dynamic_ncols=True,
+            disable=not enable,
+            colour=self.tqdm_barcolor["train"],
+        ) as t:
+            if self.profiler is not None:
+                self.profiler.start()
+            for batch in t:
+                if self._optimizer_step_limit_exceeded:
+                    sb.core.logger.info("Train iteration limit exceeded")
+                    break
+                self.step += 1
+                steps_since_ckpt += 1
+                loss = self.fit_batch(batch)
+                self.avg_train_loss = self.update_average(
+                    loss, self.avg_train_loss
+                )
+                t.set_postfix(train_loss=self.avg_train_loss)
+
+                if self.profiler is not None:
+                    self.profiler.step()
+                    if self.profiler.step_num > self.tot_prof_steps:
+                        sb.core.logger.info(
+                            "The profiler finished, training is stopped."
+                        )
+                        self.profiler.stop()
+                        quit()
+
+                # Debug mode only runs a few batches
+                if self.debug and self.step == self.debug_batches:
+                    break
+
+                if self._should_save_intra_epoch_ckpt(
+                    last_ckpt_time, steps_since_ckpt
+                ):
+                    # Checkpointer class will handle running this on main only
+                    self._save_intra_epoch_ckpt()
+                    last_ckpt_time = time.time()
+                    steps_since_ckpt = 0
+                if self.step == 10:
+                    # Benchmark model size
+                    with open(os.path.join(self.hparams.output_folder, "model_size_benchmark.txt"), "a") as f:
+                        num_params = sum([v.numel() for v in self.modules.state_dict().values()])
+                        f.write(f"{num_params}\n")
+                    break
+
+        # Run train "on_stage_end" on all processes
+        self.zero_grad(set_to_none=True)  # flush gradients
+        self.on_stage_end(sb.Stage.TRAIN, self.avg_train_loss, epoch)
+        self.avg_train_loss = 0.0
+        self.step = 0
+
 
 def dataio_prepare(hparams, tokenizer):
     """This function prepares the datasets to be used in the brain class.
@@ -430,6 +540,12 @@ def train(hparams, run_opts):
             for k, v in hparams["wavlm"].model.decoder.named_parameters()
             if "out_proj" not in k
         }
+
+        total_storage = 0
+        for j in range(i + 1):
+            total_storage += sum([v.numel() for v in hparams["decoder_mask"][hparams["new_locales"][j]].values()]) * 4
+        with open(os.path.join(hparams["output_folder"], "storage_benchmark.txt"), "a") as f:
+            f.write(f"{total_storage}\n")
 
         # Unfreeze projection layer
         hparams["wavlm"].model.decoder.out_proj.requires_grad_()

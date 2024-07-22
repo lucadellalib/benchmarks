@@ -118,6 +118,10 @@ class ASR(sb.Brain):
                 self.wer_metric.write_stats(w)
 
     def fit_batch(self, batch):
+        import time
+        torch.cuda.synchronize()
+        ts = time.time()
+
         """Fit one batch."""
         # Managing automatic mixed precision
         if self.use_amp:
@@ -173,6 +177,12 @@ class ASR(sb.Brain):
                         start = end
                     else:
                         param.grad = None
+
+            # Benchmark time
+            torch.cuda.synchronize()
+            delta_time = time.time() - ts
+            with open(os.path.join(self.hparams.output_folder, "time_benchmark.txt"), "a") as f:
+                f.write(f"{delta_time}\n")
 
             self.scaler.unscale_(self.optimizer)
             if self.check_gradients():
@@ -232,6 +242,12 @@ class ASR(sb.Brain):
                     else:
                         param.grad = None
 
+            # Benchmark time
+            torch.cuda.synchronize()
+            delta_time = time.time() - ts
+            with open(os.path.join(self.hparams.output_folder, "time_benchmark.txt"), "a") as f:
+                f.write(f"{delta_time}\n")
+
             if self.check_gradients():
                 self.optimizer.step()
             self.zero_grad()
@@ -239,6 +255,77 @@ class ASR(sb.Brain):
 
         self.on_fit_batch_end(batch, outputs, loss, True)
         return loss.detach().cpu()
+
+    def _fit_train(self, train_set, epoch, enable):
+        # Training stage
+        self.on_stage_start(sb.Stage.TRAIN, epoch)
+        self.modules.train()
+        self.zero_grad()
+
+        # Reset nonfinite count to 0 each epoch
+        self.nonfinite_count = 0
+
+        if self.train_sampler is not None and hasattr(
+            self.train_sampler, "set_epoch"
+        ):
+            self.train_sampler.set_epoch(epoch)
+
+        # Time since last intra-epoch checkpoint
+        last_ckpt_time = time.time()
+        steps_since_ckpt = 0
+        with sb.core.tqdm(
+            train_set,
+            initial=self.step,
+            dynamic_ncols=True,
+            disable=not enable,
+            colour=self.tqdm_barcolor["train"],
+        ) as t:
+            if self.profiler is not None:
+                self.profiler.start()
+            for batch in t:
+                if self._optimizer_step_limit_exceeded:
+                    sb.core.logger.info("Train iteration limit exceeded")
+                    break
+                self.step += 1
+                steps_since_ckpt += 1
+                loss = self.fit_batch(batch)
+                self.avg_train_loss = self.update_average(
+                    loss, self.avg_train_loss
+                )
+                t.set_postfix(train_loss=self.avg_train_loss)
+
+                if self.profiler is not None:
+                    self.profiler.step()
+                    if self.profiler.step_num > self.tot_prof_steps:
+                        sb.core.logger.info(
+                            "The profiler finished, training is stopped."
+                        )
+                        self.profiler.stop()
+                        quit()
+
+                # Debug mode only runs a few batches
+                if self.debug and self.step == self.debug_batches:
+                    break
+
+                if self._should_save_intra_epoch_ckpt(
+                    last_ckpt_time, steps_since_ckpt
+                ):
+                    # Checkpointer class will handle running this on main only
+                    self._save_intra_epoch_ckpt()
+                    last_ckpt_time = time.time()
+                    steps_since_ckpt = 0
+                if self.step == 10:
+                    # Benchmark model size
+                    with open(os.path.join(self.hparams.output_folder, "model_size_benchmark.txt"), "a") as f:
+                        num_params = sum([v.numel() for v in self.modules.state_dict().values()])
+                        f.write(f"{num_params}\n")
+                    break
+
+        # Run train "on_stage_end" on all processes
+        self.zero_grad(set_to_none=True)  # flush gradients
+        self.on_stage_end(sb.Stage.TRAIN, self.avg_train_loss, epoch)
+        self.avg_train_loss = 0.0
+        self.step = 0
 
 
 def dataio_prepare(hparams, tokenizer):
@@ -521,6 +608,15 @@ def train(hparams, run_opts):
         )
         del replay_brain
         asr_brain.replay_data = replay_data
+
+        total_storage = 0
+        for data in replay_data:
+            sig = data.sig[0]
+            total_storage += sig.numel() * 4
+            total_storage += len(" ".join([str(x) for x in data.target_wrd[0]]).encode("utf-8")) # Size of transcript (negligible)
+        with open(os.path.join(hparams["output_folder"], "storage_benchmark.txt"), "a") as f:
+            f.write(f"{total_storage}\n")
+
         asr_brain.fit(
             hparams["epoch_counter"],
             train_data,
