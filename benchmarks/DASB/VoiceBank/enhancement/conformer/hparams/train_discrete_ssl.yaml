@@ -3,7 +3,7 @@
 # Authors: Luca Della Libera 2024
 # ###########################################################################################
 
-experiment_name: discrete_hubert
+experiment_name: discrete_wav2vec2
 
 # Seed needs to be set at top of YAML
 seed: 0
@@ -12,8 +12,8 @@ __set_seed: !apply:torch.manual_seed [!ref <seed>]
 # Data preparation
 data_folder: !PLACEHOLDER
 train_csv: !ref <save_folder>/trainset_28spk_wav.csv
-valid_csv: !ref <save_folder>/trainset_28spk_wav.csv
-test_csv: !ref <save_folder>/trainset_28spk_wav.csv
+valid_csv: !ref <save_folder>/validset_wav.csv
+test_csv: !ref <save_folder>/testset_wav.csv
 splits: [trainset_28spk_wav, validset_wav, testset_wav]
 num_valid_speakers: 2
 
@@ -61,11 +61,11 @@ num_clusters: 1000
 vocab_size: !ref <num_clusters>
 SSL_layers: [1, 3, 7, 12, 18, 23]
 num_codebooks: !apply:len [!ref <SSL_layers>]
-ssl_hub: facebook/hubert-large-ll60k
-vocoder_hub: speechbrain/hifigan-hubert-l1-3-7-12-18-23-k1000-LibriTTS  # Must be consistent with ssl_hub/SSL_layers/num_clusters
+ssl_hub: facebook/wav2vec2-large
+vocoder_hub: chaanks/hifigan-wav2vec-l1-3-7-12-18-23-k1000-LibriTTS-V2  # Must be consistent with ssl_hub/SSL_layers/num_clusters
 kmeans_repo_id: speechbrain/SSL_Quantization
-kmeans_dataset: LibriSpeech-100-360-500
-ssl_model_type: hubert
+kmeans_dataset: LibriSpeech960
+ssl_model_type: wav2vec2
 
 # Embedding parameters
 embedding_dim: 1024
