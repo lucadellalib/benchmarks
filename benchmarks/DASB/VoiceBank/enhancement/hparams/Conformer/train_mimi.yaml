@@ -69,7 +69,7 @@ dropout: 0.1
 activation: !name:torch.nn.GELU
 d_model: 256
 nhead: 4
-num_layers: 6  # @orion_step1: --num_layers~"uniform(1, 6,discrete=True)"
+num_layers: 6  # @orion_step1: --num_layers~"uniform(1, 8,discrete=True)"
 d_ffn: 2048
 max_length: 2000
 causal: False

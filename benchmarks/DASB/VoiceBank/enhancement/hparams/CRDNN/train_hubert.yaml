@@ -70,7 +70,7 @@ freeze_embedding: False
 dropout: 0.1
 activation: !name:torch.nn.LeakyReLU
 rnn_class: !name:speechbrain.nnet.RNN.LSTM
-rnn_layers: 4  # @orion_step1: --rnn_layers~"uniform(1, 4,discrete=True)"
+rnn_layers: 4  # @orion_step1: --rnn_layers~"uniform(1, 6,discrete=True)"
 time_pooling_size: 1
 rnn_bidirectional: True
 rnn_neurons: 256
