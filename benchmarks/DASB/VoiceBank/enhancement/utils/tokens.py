@@ -326,7 +326,7 @@ class TokensLoader:
         """
         if utt_id not in self.tokens:
             raise KeyError(f"Utterance ID '{utt_id}' not found in tokens.")
-        tokens_path = self.tokens[utt_id]
+        tokens_path = self.tokens[utt_id].replace("/home/luca_dellalib", "/home/ldellal/scratch/googlecloud")
         tokens = kaldiio.load_mat(tokens_path)
         tokens = torch.from_numpy(tokens).long()
 

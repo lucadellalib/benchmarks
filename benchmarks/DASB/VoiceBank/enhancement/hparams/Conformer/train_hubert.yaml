@@ -148,7 +148,7 @@ tokens_loader_out: !new:utils.tokens.TokensLoader
 # Codec
 codec: !name:utils.tokenizer_interface.DiscreteSSLTokenizer
     save_path: !ref <save_folder>
-    ssl_model: !name:speechbrain.lobes.models.huggingface_transformers.hubert.HuBERT
+    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.hubert.HuBERT
       source: facebook/hubert-large-ll60k
       output_norm: False
       freeze: True

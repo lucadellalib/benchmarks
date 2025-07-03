@@ -3,7 +3,7 @@
 # Authors: Luca Della Libera 2024
 # ###########################################################################################
 
-run_name: wavlm_conformer
+run_name: wavtokenizer_conformer
 
 # Seed needs to be set at top of YAML
 seed: 0
@@ -56,11 +56,12 @@ annealing_factor: 0.9
 patient: 1
 
 # Codec parameters
-sample_rate: 16000  # Should match the tokenizer's sample rate
-vocab_size: 1000
-num_codebooks: 2
-kmeans_dataset: LibriSpeech
-SSL_layers: [1, 3]  #[1, 3, 7, 12, 18, 23]
+model_hub: novateur/WavTokenizer-medium-music-audio-75token
+config: wavtokenizer_mediumdata_music_audio_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml
+checkpoint: wavtokenizer_medium_music_audio_320_24k_v2.ckpt
+sample_rate: 24000
+num_codebooks: 1
+vocab_size: 4096
 
 # Embedding parameters
 embedding_dim: 1024
@@ -146,18 +147,13 @@ tokens_loader_out: !new:utils.tokens.TokensLoader
    data_path: !ref <tokens_folder>/output
 
 # Codec
-codec: !name:utils.tokenizer_interface.DiscreteSSLTokenizer
+codec: !name:utils.tokenizer_interface.WavTokenizerWrapper
+    source: !ref <model_hub>
     save_path: !ref <save_folder>
-    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
-      source: microsoft/wavlm-large
-      output_norm: False
-      freeze: True
-      freeze_feature_extractor: True
-      output_all_hiddens: True
-      save_path: !ref <save_folder>
-    vocoder_repo_id: speechbrain/hifigan-wavlm-k1000-LibriTTS
-    kmeans_dataset: !ref <kmeans_dataset>
-    num_clusters: !ref <vocab_size>
+    checkpoint: !ref <checkpoint>
+    config: !ref <config>
+    sample_rate: !ref <sample_rate>
+    freeze: True
 
 # Dataloaders
 train_dataloader_kwargs:

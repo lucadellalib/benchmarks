@@ -1,9 +1,9 @@
 # ###########################################################################################
-# Model: Conformer with discrete audio representations
+# Model: CRDNN with discrete audio representations
 # Authors: Luca Della Libera 2024
 # ###########################################################################################
 
-run_name: wavlm_conformer
+run_name: wavtokenizer_crdnn
 
 # Seed needs to be set at top of YAML
 seed: 0
@@ -21,7 +21,7 @@ num_valid_speakers: 2
 testing: True
 
 # Output folders
-output_folder: !ref results/Conformer/<run_name>/<seed>
+output_folder: !ref results/CRDNN/<run_name>/<seed>
 save_folder: !ref <output_folder>/save
 cache_folder: !name:huggingface_hub.constants.HUGGINGFACE_HUB_CACHE
 
@@ -43,24 +43,25 @@ valid_batch_size: 1
 test_batch_size: 1
 dataloader_workers: 4
 nonfinite_patience: 10
-max_grad_norm: 5.0
-precision: fp32
+max_grad_norm: 0.001
+precision: fp16
 ckpt_interval_minutes: 6000
 keep_checkpoints: 1
 
 # Optimizer parameters
-lr: 0.0005  # @orion_step1: --lr~"loguniform(0.00001,0.5)"
+lr: 0.0005  # @orion_step1: --lr~"loguniform(0.00001,0.0005)"
 weight_decay: 0.01
 improvement_threshold: 0.0025
 annealing_factor: 0.9
 patient: 1
 
 # Codec parameters
-sample_rate: 16000  # Should match the tokenizer's sample rate
-vocab_size: 1000
-num_codebooks: 2
-kmeans_dataset: LibriSpeech
-SSL_layers: [1, 3]  #[1, 3, 7, 12, 18, 23]
+model_hub: novateur/WavTokenizer-medium-music-audio-75token
+config: wavtokenizer_mediumdata_music_audio_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml
+checkpoint: wavtokenizer_medium_music_audio_320_24k_v2.ckpt
+sample_rate: 24000
+num_codebooks: 1
+vocab_size: 4096
 
 # Embedding parameters
 embedding_dim: 1024
@@ -68,13 +69,18 @@ freeze_embedding: False
 
 # Encoder parameters
 dropout: 0.1
-activation: !name:torch.nn.GELU
-d_model: 256
-nhead: 4
-num_layers: 6  # @orion_step1: --num_layers~"uniform(1, 8,discrete=True)"
-d_ffn: 2048
-max_length: 2000
-causal: False
+activation: !name:torch.nn.LeakyReLU
+rnn_class: !name:speechbrain.nnet.RNN.LSTM
+rnn_layers: 4  # @orion_step1: --rnn_layers~"uniform(1, 4,discrete=True)"
+time_pooling_size: 1
+rnn_bidirectional: True
+rnn_neurons: 256
+dnn_blocks: 2
+dnn_neurons: 256
+cnn_blocks: 2
+cnn_channels: (12, 12)
+inter_layer_pooling_size: (2, 2)
+cnn_kernelsize: (3, 3)
 
 # Modules
 embedding: !new:custom_model.Discrete_EmbeddingLayer
@@ -87,23 +93,28 @@ attention_mlp: !new:custom_model.AttentionMLP
     input_dim: !ref <embedding_dim>
     hidden_dim: !ref <embedding_dim>
 
-encoder: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR
-    input_size: !ref <embedding_dim>
-    tgt_vocab: -1
-    d_model: !ref <d_model>
-    nhead: !ref <nhead>
-    num_encoder_layers: !ref <num_layers>
-    num_decoder_layers: 0
-    d_ffn: !ref <d_ffn>
-    dropout: !ref <dropout>
+encoder: !new:speechbrain.lobes.models.CRDNN.CRDNN
+    input_shape: [null, null, !ref <embedding_dim>]
     activation: !ref <activation>
-    max_length: !ref <max_length>
-    encoder_module: conformer
-    normalize_before: True
-    causal: !ref <causal>
+    dropout: !ref <dropout>
+    cnn_blocks: !ref <cnn_blocks>
+    cnn_channels: !ref <cnn_channels>
+    cnn_kernelsize: !ref <cnn_kernelsize>
+    inter_layer_pooling_size: !ref <inter_layer_pooling_size>
+    time_pooling: True
+    using_2d_pooling: False
+    time_pooling_size: !ref <time_pooling_size>
+    rnn_class: !ref <rnn_class>
+    rnn_layers: !ref <rnn_layers>
+    rnn_neurons: !ref <rnn_neurons>
+    rnn_bidirectional: !ref <rnn_bidirectional>
+    dnn_blocks: !ref <dnn_blocks>
+    dnn_neurons: !ref <dnn_neurons>
+    rnn_re_init: False
+    use_rnnp: False
 
 head: !new:torch.nn.Linear
-    in_features: !ref <d_model>
+    in_features: !ref <dnn_neurons>
     out_features: !ref <num_codebooks> * <vocab_size>
 
 modules:
@@ -146,18 +157,13 @@ tokens_loader_out: !new:utils.tokens.TokensLoader
    data_path: !ref <tokens_folder>/output
 
 # Codec
-codec: !name:utils.tokenizer_interface.DiscreteSSLTokenizer
+codec: !name:utils.tokenizer_interface.WavTokenizerWrapper
+    source: !ref <model_hub>
     save_path: !ref <save_folder>
-    ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
-      source: microsoft/wavlm-large
-      output_norm: False
-      freeze: True
-      freeze_feature_extractor: True
-      output_all_hiddens: True
-      save_path: !ref <save_folder>
-    vocoder_repo_id: speechbrain/hifigan-wavlm-k1000-LibriTTS
-    kmeans_dataset: !ref <kmeans_dataset>
-    num_clusters: !ref <vocab_size>
+    checkpoint: !ref <checkpoint>
+    config: !ref <config>
+    sample_rate: !ref <sample_rate>
+    freeze: True
 
 # Dataloaders
 train_dataloader_kwargs:

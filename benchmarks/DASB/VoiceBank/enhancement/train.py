@@ -26,7 +26,8 @@ class Enhancement(sb.Brain):
         # toks: [B, N, K]
         self.hparams.codec.to(self.device).eval()
         self.hparams.codec.device = self.device
-        self.hparams.codec.codec_vocoder.device = self.device
+        if  hasattr(self.hparams.codec, "codec_vocoder"):
+            self.hparams.codec.codec_vocoder.device = self.device
         kwargs = {}
         if hasattr(self.hparams, "SSL_layers"):
             kwargs = {"SSL_layers": self.hparams.SSL_layers}
@@ -103,8 +104,8 @@ class Enhancement(sb.Brain):
 
     @torch.no_grad()
     def vocode(self, IDs, in_sig, out_sig, hyp_toks, out_toks, lens):
-        hyp_sig = self.toks_to_sig(hyp_toks)  # [B, T]
-        rec_sig = self.toks_to_sig(out_toks)  # [B, T]
+        hyp_sig = self.toks_to_sig(hyp_toks).to(self.device)  # [B, T]
+        rec_sig = self.toks_to_sig(out_toks).to(self.device)  # [B, T]
 
         # Adjust length
         if out_sig.shape[-1] > hyp_sig.shape[-1]:
@@ -259,6 +260,8 @@ if __name__ == "__main__":
             "Model parameters/buffers (M)": f"{model_params / 1e6:.2f}",
         },
     )
+    hparams["compute_metrics"] = True
+    hparams["codec"] = hparams["codec"]()
 
     # Trainer initialization
     brain = Enhancement(

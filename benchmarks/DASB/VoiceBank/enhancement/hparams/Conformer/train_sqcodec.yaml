@@ -59,7 +59,7 @@ patient: 1
 sample_rate: 16000  # Should match the tokenizer's sample rate
 vocab_size: 19683
 num_codebooks: 2
-tokenizer_save_path: /home/luca/Downloads/SQ-Codec/sqcodec
+tokenizer_save_path: /home/ldellal/scratch/googlecloud/benchmarks/benchmarks/DASB/SQ-Codec
 
 # Embedding parameters
 embedding_dim: 1024
